@@ -1,5 +1,5 @@
 [package]
-name = "ActualFire-Games/module-loader"
+name = "actualfire-games/module-loader"
 description = "A simple attribute-driven module loader for Roblox with with module relocation and parallel execution support."
 version = "1.0.0"
 license = "MIT"
@@ -7,4 +7,4 @@ authors = ["ActualFire Games LLC"]
 realm = "shared"
 registry = "https://github.com/upliftgames/wally-index"
 repository = "https://github.com/ActualFire-Games/module-loader"
-exclude = [".github"]
+exclude = [".github", "rokit.toml", "selene.toml"]
