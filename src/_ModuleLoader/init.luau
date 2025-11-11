@@ -50,11 +50,13 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
 local ServerScriptService = game:GetService("ServerScriptService")
 
 -----------------------------
 -- VARIABLES --
 -----------------------------
+local parallelModuleLoader = script.ParallelModuleLoader
 local actorForServer: Actor? = script:FindFirstChild("ActorForServer") :: any
 local actorForClient: Actor? = script:FindFirstChild("ActorForClient") :: any
 local isClient = RunService:IsClient()
@@ -105,7 +107,7 @@ local TAG = script:GetAttribute("LoaderTag") or "LOAD_MODULE"
 local PRINT_IDENTIFIER = if isClient then "[C]" else "[S]"
 local LOADED_IDENTIFIER = if isClient then "Client" else "Server"
 local ACTOR_PARENT = if isClient
-	then game:GetService("Players").LocalPlayer.PlayerScripts
+	then Players.LocalPlayer.PlayerScripts
 	else game:GetService("ServerScriptService")
 local RELOCATED_MODULES
 do
@@ -339,9 +341,12 @@ local function loadModule(module: ModuleScript)
 			newWarn(`Parallel module {module.Name} requested but no Actor template is configured - loading normally`)
 		else
 			-- This module needs to be run in parallel, so create new actor and script.
-			local newActorSystem = if isClient then actorForClient:Clone() else actorForServer:Clone()
-			local actorScript = newActorSystem:FindFirstChildWhichIsA("BaseScript")
-
+			local newActorSystem = actorTemplate:Clone()
+			local loaderClone = parallelModuleLoader:Clone()
+			loaderClone.Parent = newActorSystem
+			local actorScript: BaseScript = newActorSystem:FindFirstChildWhichIsA("BaseScript") :: any
+			
+			actorScript.Enabled = true
 			actorScript.Name = `Required{module.Name}`
 			newActorSystem.Parent = ACTOR_PARENT
 

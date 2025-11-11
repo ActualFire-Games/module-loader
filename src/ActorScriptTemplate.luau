@@ -7,8 +7,7 @@
 -----------------------------
 -- DEPENDENCIES --
 -----------------------------
--- Navigate up: script.Parent (Actor) -> Parent (ModuleLoader) -> Parent (src) -> ParallelModuleLoader
-local ParallelModuleLoader = require(script.Parent.Parent.Parent.ParallelModuleLoader)
+local ParallelModuleLoader = require(script.Parent.ParallelModuleLoader)
 
 -----------------------------
 -- VARIABLES --
