@@ -1,10 +1,22 @@
 [package]
 name = "crusherfire/module-loader"
 description = "A simple attribute-driven module loader for Roblox with with module relocation and parallel execution support."
-version = "1.0.0"
+version = "1.0.1"
 license = "MIT"
 authors = ["ActualFire Games LLC"]
 realm = "shared"
 registry = "https://github.com/upliftgames/wally-index"
 repository = "https://github.com/ActualFire-Games/module-loader"
-exclude = [".github", "rokit.toml", "selene.toml"]
+exclude = [
+    "**",
+]
+include = [
+    "default.project.json",
+    "src",
+    "src/**",
+    "LICENSE",
+    "wally.toml",
+    "README.md",
+    "rbxm",
+    "rbxm/*.rbxmx",
+]

@@ -633,7 +633,7 @@ end
 local function getModules(containers: { Instance }): { ModuleScript }
 	local totalModules = {}
 	for _, container in ipairs(containers) do
-		local modules = findAllFromClass("ModuleScript", container)
+		local modules = findAllFromClass("ModuleScript", container, SETTINGS.FOLDER_SEARCH_DEPTH)
 		modules = filter(modules, function(module)
 			return keepModule(container, module)
 		end)
@@ -712,17 +712,13 @@ local function start(...: Instance)
 			if not tracker.Load[module] then
 				continue
 			end
-			if tracker.Load[module] then
-				initializeModule(tracker.Load[module], module)
-			end
+			initializeModule(tracker.Load[module], module)
 		end
 		for _, module in modules do
 			if not tracker.Load[module] then
 				continue
 			end
-			if tracker.Load[module] then
-				startModule(tracker.Load[module], module)
-			end
+			startModule(tracker.Load[module], module)
 		end
 	end
 
