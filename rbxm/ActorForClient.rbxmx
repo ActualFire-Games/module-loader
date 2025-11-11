@@ -1,0 +1,111 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<Meta name="ExplicitAutoJoints">true</Meta>
+	<External>null</External>
+	<External>nil</External>
+	<Item class="Actor" referent="RBXA8E0423D617C41AB8E9139F78314AACE">
+		<Properties>
+			<token name="LevelOfDetail">0</token>
+			<CoordinateFrame name="ModelMeshCFrame">
+				<X>0</X>
+				<Y>0</Y>
+				<Z>0</Z>
+				<R00>1</R00>
+				<R01>0</R01>
+				<R02>0</R02>
+				<R10>0</R10>
+				<R11>1</R11>
+				<R12>0</R12>
+				<R20>0</R20>
+				<R21>0</R21>
+				<R22>1</R22>
+			</CoordinateFrame>
+			<SharedString name="ModelMeshData">yuZpQdnvvUBOTYh1jqZ2cA==</SharedString>
+			<Vector3 name="ModelMeshSize">
+				<X>0</X>
+				<Y>0</Y>
+				<Z>0</Z>
+			</Vector3>
+			<token name="ModelStreamingMode">0</token>
+			<bool name="NeedsPivotMigration">false</bool>
+			<Ref name="PrimaryPart">null</Ref>
+			<float name="ScaleFactor">1</float>
+			<SharedString name="SlimHash">yuZpQdnvvUBOTYh1jqZ2cA==</SharedString>
+			<OptionalCoordinateFrame name="WorldPivotData">
+				<CFrame>
+					<X>0</X>
+					<Y>0</Y>
+					<Z>0</Z>
+					<R00>1</R00>
+					<R01>0</R01>
+					<R02>0</R02>
+					<R10>0</R10>
+					<R11>1</R11>
+					<R12>0</R12>
+					<R20>0</R20>
+					<R21>0</R21>
+					<R22>1</R22>
+				</CFrame>
+			</OptionalCoordinateFrame>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+			<bool name="DefinesCapabilities">false</bool>
+			<string name="Name">ActorForClient</string>
+			<int64 name="SourceAssetId">-1</int64>
+			<BinaryString name="Tags"></BinaryString>
+		</Properties>
+		<Item class="LocalScript" referent="RBX40091F5367B94091869751E191A6AAD7">
+			<Properties>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--@author: crusherfire
+--@date: 11/11/25
+--[[@description:
+	Should be placed as a child script of the actor.
+]]
+-----------------------------
+-- DEPENDENCIES --
+-----------------------------
+-- Navigate up: script.Parent (Actor) -> Parent (ModuleLoader) -> Parent (src) -> ParallelModuleLoader
+local ParallelModuleLoader = require(script.Parent.Parent.Parent.ParallelModuleLoader)
+
+-----------------------------
+-- VARIABLES --
+-----------------------------
+local actor: Actor = script.Parent
+
+-----------------------------
+-- HANDLERS --
+-----------------------------
+actor:BindToMessage("RequireModule", function(module: ModuleScript)
+	ParallelModuleLoader.onRequireModule(script, module)
+end)
+
+actor:BindToMessage("InitModule", function()
+	ParallelModuleLoader.onInitModule(script)
+end)
+
+actor:BindToMessage("StartModule", function()
+	ParallelModuleLoader.onStartModule(script)
+end)
+
+-----------------------------
+-- MAIN --
+-----------------------------
+script:SetAttribute("Loaded", true)]]></ProtectedString>
+				<bool name="Disabled">false</bool>
+				<Content name="LinkedSource"><null></null></Content>
+				<token name="RunContext">0</token>
+				<string name="ScriptGuid">{138C8712-24B4-4D5B-97E7-919C7D7503F0}</string>
+				<BinaryString name="AttributesSerialize"><![CDATA[BAAAAAsAAABJbml0aWFsaXplZAMABgAAAExvYWRlZAMADAAAAExvYWRlZE1vZHVsZQMABwAA
+AFN0YXJ0ZWQDAA==]]></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">LocalScript</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+		</Item>
+	</Item>
+	<SharedStrings>
+		<SharedString md5="yuZpQdnvvUBOTYh1jqZ2cA=="></SharedString>
+	</SharedStrings>
+</roblox>

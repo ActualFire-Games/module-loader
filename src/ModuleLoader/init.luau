@@ -55,13 +55,13 @@ local ServerScriptService = game:GetService("ServerScriptService")
 -----------------------------
 -- VARIABLES --
 -----------------------------
-local actorForServer = script.ActorForServer
-local actorForClient = script.ActorForClient
+local actorForServer: Actor? = script:FindFirstChild("ActorForServer") :: any
+local actorForClient: Actor? = script:FindFirstChild("ActorForClient") :: any
 local isClient = RunService:IsClient()
 local require = require
 local loadedEvent: RemoteEvent
 if isClient then
-	loadedEvent = script:WaitForChild("LoadedEvent")
+	loadedEvent = script:WaitForChild("LoadedEvent") :: any
 else
 	loadedEvent = Instance.new("RemoteEvent")
 	loadedEvent.Name = "LoadedEvent"
@@ -94,19 +94,19 @@ export type KeepModulePredicate = (container: Instance, module: ModuleScript) ->
 
 -- CONSTANTS --
 local SETTINGS: LoaderSettings = {
-	FOLDER_SEARCH_DEPTH = script:GetAttribute("FolderSearchDepth"),
-	YIELD_THRESHOLD = script:GetAttribute("YieldThreshold"), -- how long until the module starts warning for a module that is taking too long
-	VERBOSE_LOADING = script:GetAttribute("VerboseLoading"),
-	WAIT_FOR_SERVER = script:GetAttribute("ClientWaitForServer"),
-	USE_COLLECTION_SERVICE = script:GetAttribute("UseCollectionService"),
+	FOLDER_SEARCH_DEPTH = script:GetAttribute("FolderSearchDepth") or 1,
+	YIELD_THRESHOLD = script:GetAttribute("YieldThreshold") or 10, -- how long until the module starts warning for a module that is taking too long
+	VERBOSE_LOADING = script:GetAttribute("VerboseLoading") == true or false,
+	WAIT_FOR_SERVER = script:GetAttribute("ClientWaitForServer") == true or false,
+	USE_COLLECTION_SERVICE = script:GetAttribute("UseCollectionService") == true or false,
 }
 
+local TAG = script:GetAttribute("LoaderTag") or "LOAD_MODULE"
 local PRINT_IDENTIFIER = if isClient then "[C]" else "[S]"
 local LOADED_IDENTIFIER = if isClient then "Client" else "Server"
 local ACTOR_PARENT = if isClient
 	then game:GetService("Players").LocalPlayer.PlayerScripts
 	else game:GetService("ServerScriptService")
-local TAG = script:GetAttribute("LoaderTag")
 local RELOCATED_MODULES
 do
 	if RunService:IsServer() then
@@ -323,7 +323,9 @@ local function loadModule(module: ModuleScript)
 			)
 			return
 		end
-		local clone = script.RelocatedTemplate:Clone()
+		local relocatedTemplate = script:FindFirstChild("RelocatedTemplate")
+		assert(relocatedTemplate, "ModuleLoader missing RelocatedTemplate child")
+		local clone = relocatedTemplate:Clone()
 		clone.Name = module.Name
 		clone:SetAttribute("ServerOnly", true)
 		clone.Parent = module.Parent
@@ -331,46 +333,52 @@ local function loadModule(module: ModuleScript)
 	end
 
 	if module:GetAttribute("Parallel") then
-		-- This module needs to be run in parallel, so create new actor and script.
-		local newActorSystem = if isClient then actorForClient:Clone() else actorForServer:Clone()
-		local actorScript = newActorSystem:FindFirstChildWhichIsA("BaseScript")
+		local actorTemplate = if isClient then actorForClient else actorForServer
 
-		actorScript.Name = `Required{module.Name}`
-		newActorSystem.Parent = ACTOR_PARENT
+		if actorTemplate == nil then
+			newWarn(`Parallel module {module.Name} requested but no Actor template is configured - loading normally`)
+		else
+			-- This module needs to be run in parallel, so create new actor and script.
+			local newActorSystem = if isClient then actorForClient:Clone() else actorForServer:Clone()
+			local actorScript = newActorSystem:FindFirstChildWhichIsA("BaseScript")
 
-		if not actorScript:GetAttribute("Loaded") then
-			actorScript:GetAttributeChangedSignal("Loaded"):Wait()
+			actorScript.Name = `Required{module.Name}`
+			newActorSystem.Parent = ACTOR_PARENT
+
+			if not actorScript:GetAttribute("Loaded") then
+				actorScript:GetAttributeChangedSignal("Loaded"):Wait()
+			end
+
+			newActorSystem:SendMessage("RequireModule", module)
+
+			if SETTINGS.VERBOSE_LOADING then
+				newPrint(("Loading PARALLEL module '%s'"):format(module.Name))
+			end
+
+			local startTime = tick()
+			if not actorScript:GetAttribute("Required") then
+				actorScript:GetAttributeChangedSignal("Required"):Wait()
+			end
+			local endTime = tick()
+
+			if SETTINGS.VERBOSE_LOADING and not actorScript:GetAttribute("Errored") then
+				newPrint(`>> Loaded PARALLEL module {module.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
+			elseif actorScript:GetAttribute("Errored") then
+				newWarn(
+					`>> Failed to load PARALLEL module {module.Name}`,
+					("(took %.3f seconds)"):format(endTime - startTime)
+				)
+			end
+
+			-- relocate after loading to maintain relative paths within modules
+			attemptRelocate(module)
+
+			trackerForActors.Load[module] = newActorSystem
+			tracker.Load[module] = true
+			tracker.Init[module] = true
+			tracker.Start[module] = true
+			return
 		end
-
-		newActorSystem:SendMessage("RequireModule", module)
-
-		if SETTINGS.VERBOSE_LOADING then
-			newPrint(("Loading PARALLEL module '%s'"):format(module.Name))
-		end
-
-		local startTime = tick()
-		if not actorScript:GetAttribute("Required") then
-			actorScript:GetAttributeChangedSignal("Required"):Wait()
-		end
-		local endTime = tick()
-
-		if SETTINGS.VERBOSE_LOADING and not actorScript:GetAttribute("Errored") then
-			newPrint(`>> Loaded PARALLEL module {module.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
-		elseif actorScript:GetAttribute("Errored") then
-			newWarn(
-				`>> Failed to load PARALLEL module {module.Name}`,
-				("(took %.3f seconds)"):format(endTime - startTime)
-			)
-		end
-
-		-- relocate after loading to maintain relative paths within modules
-		attemptRelocate(module)
-
-		trackerForActors.Load[module] = newActorSystem
-		tracker.Load[module] = true
-		tracker.Init[module] = true
-		tracker.Start[module] = true
-		return
 	end
 
 	if SETTINGS.VERBOSE_LOADING then

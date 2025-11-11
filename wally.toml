@@ -6,5 +6,5 @@ license = "MIT"
 authors = ["ActualFire Games LLC"]
 realm = "shared"
 registry = "https://github.com/upliftgames/wally-index"
-repository = "https://github.com/crusherfire/module-loader"
-exclude = ["rbxm", ".github"]
+repository = "https://github.com/ActualFire-Games/module-loader"
+exclude = [".github"]
