@@ -1,5 +1,5 @@
 [package]
-name = "actualfire-games/module-loader"
+name = "crusherfire/module-loader"
 description = "A simple attribute-driven module loader for Roblox with with module relocation and parallel execution support."
 version = "1.0.0"
 license = "MIT"
