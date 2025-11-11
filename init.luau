@@ -1,1 +1,1 @@
-return require(script.src.ModuleLoader)
+return require(script.src._ModuleLoader)
