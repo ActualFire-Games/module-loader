@@ -7,7 +7,7 @@
 -----------------------------
 -- DEPENDENCIES --
 -----------------------------
-local ParallelModuleLoader = require(script.Parent.ParallelModuleLoader)
+local ParallelModuleLoader = require(script.Parent:WaitForChild("ParallelModuleLoader"))
 
 -----------------------------
 -- VARIABLES --

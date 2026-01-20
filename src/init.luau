@@ -47,7 +47,6 @@
 -----------------------------
 -- SERVICES --
 -----------------------------
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
@@ -345,7 +344,7 @@ local function loadModule(module: ModuleScript)
 			local loaderClone = parallelModuleLoader:Clone()
 			loaderClone.Parent = newActorSystem
 			local actorScript: BaseScript = newActorSystem:FindFirstChildWhichIsA("BaseScript") :: any
-			
+
 			actorScript.Enabled = true
 			actorScript.Name = `Required{module.Name}`
 			newActorSystem.Parent = ACTOR_PARENT
@@ -362,6 +361,14 @@ local function loadModule(module: ModuleScript)
 
 			local startTime = tick()
 			if not actorScript:GetAttribute("Required") then
+				-- Immediate security warning as yielding can delay relocation of modules
+				if RunService:IsServer() then
+					newWarn(
+						`[SECURITY] Module '{module.Name}' yielded during require()!\n`,
+						`Modules with RelocateToServerScriptService may still be accessible to clients.\n`,
+						`Avoid yielding in module top-level code to ensure timely relocation.`
+					)
+				end
 				actorScript:GetAttributeChangedSignal("Required"):Wait()
 			end
 			local endTime = tick()
@@ -423,6 +430,15 @@ local function loadModule(module: ModuleScript)
 		endTime = tick()
 	end
 	if coroutine.status(thread) == "suspended" then
+		-- Immediate security warning as yielding can delay relocation of modules
+		if RunService:IsServer() then
+			newWarn(
+				`[SECURITY] Module '{module.Name}' yielded during require()!\n`,
+				`Modules with RelocateToServerScriptService may still be accessible to clients.\n`,
+				`Avoid yielding in module top-level code to ensure timely relocation.`
+			)
+		end
+
 		local loopThread = task.spawn(function()
 			task.wait(SETTINGS.YIELD_THRESHOLD)
 			while true do
