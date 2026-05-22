@@ -1,7 +1,7 @@
 [package]
 name = "crusherfire/module-loader"
 description = "A simple attribute-driven module loader for Roblox with with module relocation and parallel execution support."
-version = "2.1.0"
+version = "2.2.0"
 license = "MIT"
 authors = ["ActualFire Games LLC"]
 realm = "shared"

@@ -60,13 +60,20 @@
 	"IgnoreLoader" boolean attribute:
 	Allows you to prevent a module from being loaded.
 	
-	Supports CollectionService tags by placing the tag name (defined by LoaderTag attribute) on ModuleScript instances.
+	Supports CollectionService tags on ModuleScripts AND Folders. Tagging a Folder loads every
+	descendant ModuleScript (subject to ClientOnly / ServerOnly / IgnoreLoader filtering).
+	If a tagged folder is also marked for RelocateToReplicatedStorage, the relocation pre-pass
+	mirrors the tag onto the corresponding folder under ReplicatedStorage.RELOCATED_MODULES so
+	clients discover the relocated modules via the same tag without extra setup. A module that
+	resolves to an already-loaded value (e.g. via both a pointer and its real target) is
+	deduplicated automatically so Init/Start fire once per loaded result.
 	
 	-- LOADER ATTRIBUTE SETTINGS --
 	ClientWaitForPersistentLoaded: Client waits for all persistent models to be loaded in workspace if instance streaming is enabled.
 	ClientWaitForServer: Client avoids starting the module loading process until the server finishes.
 	FolderSearchDepth: How deep the loader will search for modules to load in a folder. '1' represents the direct children.
-	LoaderTag: Tag to be set on modules you want to load that are not within loaded containers.
+	LoaderTag: Tag to be set on ModuleScripts (or Folders, to load every descendant ModuleScript)
+	you want to load that are not within loaded containers.
 	VerboseLoading: If messages should be output that document the loading process
 	YieldThreshold: How long to wait (in seconds) before displaying warning messages when a particular module is yielidng for too long
 	UseCollectionService: If the loader should search for modules to load based on LoaderTag
@@ -134,6 +141,11 @@ local trackerForActors = {
 	Init = {},
 	Start = {}
 }
+
+-- Indexed by the table that a successful require() returned. Lets the loader
+-- skip duplicate Init/Start when two ModuleScripts resolve to the same value
+-- (most notably a relocation pointer and its real target both being discovered).
+local seenResults: { [any]: true } = {}
 
 export type LoaderSettings = {
 	WAIT_FOR_PERSISTENT: boolean?,
@@ -423,6 +435,14 @@ local function getOrCreateMirroredParent(rootFolder: Folder, ancestors: { Instan
 			folder.Parent = current
 			current = folder
 		end
+		-- Mirror the configured loader tag onto the mirror folder if the original
+		-- carries it, so the client (which can't see the SSS original) discovers
+		-- relocated modules via the same tag walk that the server uses.
+		if SETTINGS.USE_COLLECTION_SERVICE and TAG ~= "" and CollectionService:HasTag(original, TAG) then
+			if not CollectionService:HasTag(current, TAG) then
+				CollectionService:AddTag(current, TAG)
+			end
+		end
 	end
 	return current
 end
@@ -638,17 +658,25 @@ local function loadModule(module: ModuleScript)
 		end, debug.traceback)
 		debug.resetmemorycategory()
 		if success then
-			tracker.Load[module] = result
-			if result.Init then
-				tracker.Init[module] = false
-			end
-			if result.Start then
-				tracker.Start[module] = false
-			end
-			executionSuccess = true
+			-- If another ModuleScript already produced this same loaded value
+			-- (e.g. a relocation pointer and its real target were both discovered),
+			-- skip tracker registration so Init/Start fire exactly once per result.
+			if seenResults[result] then
+				executionSuccess = true
+			else
+				seenResults[result] = true
+				tracker.Load[module] = result
+				if result.Init then
+					tracker.Init[module] = false
+				end
+				if result.Start then
+					tracker.Start[module] = false
+				end
+				executionSuccess = true
 
-			-- relocate after loading to maintain relative paths within modules
-			attemptRelocate(module)
+				-- relocate after loading to maintain relative paths within modules
+				attemptRelocate(module)
+			end
 		else
 			errMsg = result
 		end
@@ -868,18 +896,31 @@ local function getModules(containers: { Instance }): { ModuleScript }
 		totalModules = mergeArrays(totalModules, modules)
 	end
 	if SETTINGS.USE_COLLECTION_SERVICE and TAG ~= "" then
-		for _, module in CollectionService:GetTagged(TAG) do
-			if not module:IsA("ModuleScript") then
-				warn(`item: {module} with tag: {TAG} is not a module script!`)
-				continue
-			end
-			if not keepModule(module.Parent, module) then
-				continue
+		local function addTaggedModule(parent: Instance, module: ModuleScript)
+			if not keepModule(parent, module) then
+				return
 			end
 			if table.find(totalModules, module) then
-				continue
+				return
 			end
 			table.insert(totalModules, module)
+		end
+
+		for _, tagged in CollectionService:GetTagged(TAG) do
+			if tagged:IsA("ModuleScript") then
+				local parent = tagged.Parent
+				if parent then
+					addTaggedModule(parent, tagged)
+				end
+			elseif tagged:IsA("Folder") then
+				for _, descendant in tagged:GetDescendants() do
+					if descendant:IsA("ModuleScript") then
+						addTaggedModule(tagged, descendant)
+					end
+				end
+			else
+				warn(`item: {tagged} with tag: {TAG} is not a ModuleScript or Folder!`)
+			end
 		end
 	end
 
