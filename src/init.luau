@@ -565,6 +565,27 @@ local function isMarkedForReplicatedRelocation(module: ModuleScript, container: 
 end
 
 --[[
+	Returns true if <code>module</code> sits under a Folder marked RelocateToReplicatedStorage, in which
+	case a RelocateToServerScriptService attribute on it is acting as a cascade opt-out (intentionally
+	keeping the module on the server) rather than a redundant request to move an already-server module
+	into ServerScriptService. The closest Folder ancestor with the attribute set wins, mirroring the
+	cascade precedence used elsewhere.
+]]
+local function isOptingOutOfReplicatedRelocation(module: Instance): boolean
+	local ancestor: Instance? = module.Parent
+	while ancestor do
+		if ancestor:IsA("Folder") then
+			local value = ancestor:GetAttribute("RelocateToReplicatedStorage")
+			if value ~= nil then
+				return value == true
+			end
+		end
+		ancestor = ancestor.Parent
+	end
+	return false
+end
+
+--[[
 	Relocates a single module to ReplicatedStorage.RELOCATED_MODULES if eligible, leaving a
 	hierarchy-aware pointer behind. <code>container</code> is the discovery boundary the mirror is built
 	relative to. <code>seen</code> (keyed on the real module) guards a module reachable via both a
@@ -726,9 +747,15 @@ local function loadModule(module: ModuleScript)
 			return
 		end
 		if module:IsDescendantOf(ServerScriptService) then
-			warn(
-				`RelocateToServerScriptService attribute is enabled on module '{module:GetFullName()}' that's already in ServerScriptService`
-			)
+			-- A module under a RelocateToReplicatedStorage folder uses RelocateToServerScriptService
+			-- as a cascade opt-out: it is meant to stay on the server, so being already in
+			-- ServerScriptService is correct, not a mistake. Only warn about a genuinely redundant
+			-- attribute (no relocating ancestor folder to opt out of).
+			if not isOptingOutOfReplicatedRelocation(module) then
+				warn(
+					`RelocateToServerScriptService attribute is enabled on module '{module:GetFullName()}' that's already in ServerScriptService`
+				)
+			end
 			return
 		end
 		local relocatedTemplate = script:FindFirstChild("RelocatedTemplate")
