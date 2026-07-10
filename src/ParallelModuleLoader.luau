@@ -4,7 +4,7 @@
 --[[@description:
 	General code for parallel scripts.
 ]]
--- Since this module will be required by scripts in separate actors, these variables won't be shared!
+-- Since this module will be copied & placed in separate actors, these variables won't be shared!
 local require = require
 local requiredModule
 local function onRequireModule(script: BaseScript, module: ModuleScript)
@@ -33,7 +33,9 @@ local function onInitModule(script: BaseScript)
 		script:SetAttribute("Initialized", true)
 		return
 	end
-	if not requiredModule.Init then
+	-- Non-table results have no lifecycle; indexing .Init on them would error and leave
+	-- the loader's Initialized wait hanging forever.
+	if type(requiredModule) ~= "table" or not requiredModule.Init then
 		script:SetAttribute("Initialized", true)
 		return
 	end
@@ -62,7 +64,8 @@ local function onStartModule(script: BaseScript)
 		script:SetAttribute("Started", true)
 		return
 	end
-	if not requiredModule.Start then
+	-- See onInitModule: non-table results have no lifecycle.
+	if type(requiredModule) ~= "table" or not requiredModule.Start then
 		script:SetAttribute("Started", true)
 		return
 	end

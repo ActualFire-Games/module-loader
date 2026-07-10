@@ -3,8 +3,8 @@
 	Unified hierarchy-aware pointer left behind when a module is relocated.
 
 	The ModuleLoader writes two attributes on every pointer at relocation time:
-		_RelocatedService	— "ServerScriptService" or "ReplicatedStorage"
-		_RelocatedPath		— dot-separated path under that service's RELOCATED_MODULES
+		_RelocatedService	"ServerScriptService" or "ReplicatedStorage"
+		_RelocatedPath		dot-separated path under that service's RELOCATED_MODULES
 							folder (e.g. "Gameplay.Combat.Shared.DamageMath")
 
 	The pointer resolves by walking the path with WaitForChild so first-join
@@ -47,4 +47,12 @@ for segment in string.gmatch(relocatedPath, "[^%.]+") do
 	assert(current, `Relocated pointer '{script:GetFullName()}' could not resolve segment '{segment}' of path '{relocatedPath}'`)
 end
 
-return require(current :: ModuleScript) :: any
+local target = current :: Instance
+-- Guard against name collisions in the mirror (WaitForChild resolves by name alone): failing
+-- loudly here beats require() throwing a vaguer error on a Folder.
+assert(
+	target:IsA("ModuleScript"),
+	`Relocated pointer '{script:GetFullName()}' resolved path '{relocatedPath}' to '{target:GetFullName()}', which is not a ModuleScript`
+)
+
+return require(target) :: any
