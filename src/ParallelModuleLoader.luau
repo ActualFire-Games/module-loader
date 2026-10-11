@@ -4,13 +4,26 @@
 --[[@description:
 	General code for parallel scripts.
 ]]
--- Since this module will be copied & placed in separate actors, these variables won't be shared!
+-----------------------------
+-- VARIABLES --
+-----------------------------
+local Module = {}
+
+-- Each Actor gets its own copy of this module, so these variables are never
+-- shared between Actors.
+-- A local alias keeps the type checker from trying to resolve requires of
+-- modules found at runtime.
 local require = require
-local requiredModule
-local function onRequireModule(script: BaseScript, module: ModuleScript)
-	local success, result = pcall(function()
+local requiredModule: any = nil
+
+-----------------------------
+-- PUBLIC FUNCTIONS --
+-----------------------------
+
+function Module.onRequireModule(script: BaseScript, module: ModuleScript)
+	local success, result = xpcall(function()
 		return require(module)
-	end)
+	end, debug.traceback)
 
 	if not success then
 		warn("Parallel module errored!\n", result)
@@ -22,7 +35,7 @@ local function onRequireModule(script: BaseScript, module: ModuleScript)
 	script:SetAttribute("Required", true)
 end
 
-local function onInitModule(script: BaseScript)
+function Module.onInitModule(script: BaseScript)
 	if script:GetAttribute("Errored") then
 		warn("Unable to init errored module!")
 		script:SetAttribute("Initialized", true)
@@ -33,16 +46,16 @@ local function onInitModule(script: BaseScript)
 		script:SetAttribute("Initialized", true)
 		return
 	end
-	-- Non-table results have no lifecycle; indexing .Init on them would error and leave
-	-- the loader's Initialized wait hanging forever.
+	-- Non-table results have no lifecycle; indexing .Init on them would error
+	-- and leave the loader's Initialized wait hanging forever.
 	if type(requiredModule) ~= "table" or not requiredModule.Init then
 		script:SetAttribute("Initialized", true)
 		return
 	end
 
-	local success, result = pcall(function()
+	local success, result = xpcall(function()
 		requiredModule:Init()
-	end)
+	end, debug.traceback)
 
 	if not success then
 		warn("Parallel module errored!\n", result)
@@ -53,7 +66,7 @@ local function onInitModule(script: BaseScript)
 	script:SetAttribute("Initialized", true)
 end
 
-local function onStartModule(script: BaseScript)
+function Module.onStartModule(script: BaseScript)
 	if script:GetAttribute("Errored") then
 		warn("Unable to start errored module!")
 		script:SetAttribute("Started", true)
@@ -70,9 +83,9 @@ local function onStartModule(script: BaseScript)
 		return
 	end
 
-	local success, result = pcall(function()
+	local success, result = xpcall(function()
 		requiredModule:Start()
-	end)
+	end, debug.traceback)
 
 	if not success then
 		warn("Parallel module errored!\n", result)
@@ -83,4 +96,4 @@ local function onStartModule(script: BaseScript)
 	script:SetAttribute("Started", true)
 end
 
-return { onRequireModule = onRequireModule, onInitModule = onInitModule, onStartModule = onStartModule }
+return Module

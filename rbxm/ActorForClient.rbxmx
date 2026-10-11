@@ -57,22 +57,25 @@
 			<Properties>
 				<ProtectedString name="Source"><![CDATA[--!strict
 --@author: crusherfire
---@date: 11/11/25
+--@date: 5/8/24
 --[[@description:
-	Should be placed as a child script of the actor.
+	General code for loading parallel module scripts.
 ]]
 -----------------------------
 -- DEPENDENCIES --
 -----------------------------
-local ParallelModuleLoader = require(script.Parent.ParallelModuleLoader)
+-- The loader clones the ParallelModuleLoader into this actor as a sibling of
+-- this LocalScript, so we resolve it relatively rather than hardcoding a path
+-- under ReplicatedStorage.
+const ParallelModuleLoader = require(script.Parent:WaitForChild("ParallelModuleLoader"))
 
 -----------------------------
 -- VARIABLES --
 -----------------------------
-local actor: Actor = script.Parent
+local actor = script.Parent
 
 -----------------------------
--- HANDLERS --
+-- MAIN --
 -----------------------------
 actor:BindToMessage("RequireModule", function(module: ModuleScript)
 	ParallelModuleLoader.onRequireModule(script, module)
@@ -86,9 +89,6 @@ actor:BindToMessage("StartModule", function()
 	ParallelModuleLoader.onStartModule(script)
 end)
 
------------------------------
--- MAIN --
------------------------------
 script:SetAttribute("Loaded", true)]]></ProtectedString>
 				<bool name="Disabled">false</bool>
 				<Content name="LinkedSource"><null></null></Content>

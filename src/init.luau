@@ -1,101 +1,149 @@
 --!strict
---[[
-	----
-	crusherfire's Module Loader
-	Created: 08/05/2025
-	Updated: 07/09/2026
-	----
+--@author: crusherfire
+--@date: 08/05/2025
+--[[@description:
+	crusherfire's Module Loader. Finds ModuleScripts, loads them in priority
+	order, and runs an optional :Init() then :Start() on each. Runs on the
+	server and the client. Configure it with attributes on modules, on folders
+	(some cascade to their descendant modules), or on the loader script itself.
 
-	A lightweight loader that finds ModuleScripts, loads them in priority order, and runs
-	an optional :Init() then :Start() lifecycle method on each. Runs on the server and the
-	client. Configure it with attributes on modules, on folders (which cascade to their
-	descendant modules), or on the loader script itself.
+	-- LIFECYCLE --
+	Every discovered module is required first, then :Init() runs on each, then
+	:Start() runs on each, all in LoaderPriority order. Each call must return
+	before the next one begins, so a yielding Init or Start holds up every
+	module after it. A call still running after YieldThreshold seconds logs a
+	warning every few seconds until it returns.
+	A module that fails to require gets no Init or Start. A module whose
+	:Init() errors gets no :Start(). A module found more than once (overlapping
+	containers, a tag and a container, or a relocation pointer and its target)
+	runs its lifecycle once.
+	A method a module only inherits through its metatable is skipped when
+	another loaded module defines it (e.g. a Client service inheriting its
+	Shared service's Init). The defining module runs it once, with itself as
+	self.
 
 	-- MODULE ATTRIBUTES --
-	Set on a ModuleScript, or on a Folder to cascade to every descendant ModuleScript.
+	Set on a ModuleScript. ClientOnly, ServerOnly, IgnoreLoader, and
+	RelocateToReplicatedStorage may also be set on a Folder, which cascades
+	them to every descendant ModuleScript.
+	Every attribute except LoaderPriority is a boolean. A wrongly typed one
+	logs a warning and counts as true, except RelocateToReplicatedStorage,
+	which counts as false, so a typo never sends a module to clients.
 
 	LoaderPriority (number, default 0)
-		Higher numbers load first.
+		Higher numbers load first. Equal priorities have no fixed order. A
+		value that is not a number logs a warning and counts as 0.
 
 	ClientOnly / ServerOnly (boolean)
-		Restrict a module to one run context. A value set on the module itself (even
-		false) overrides a cascading folder value, and the closest folder wins.
+		Restrict a module to one run context. A value set on the module itself
+		(even false) overrides a cascading folder value, and the closest folder
+		wins.
 
 	IgnoreLoader (boolean)
-		Skip the module completely. Same cascade and override rules as ClientOnly.
+		Never require the module, so it gets no Init or Start. Relocation still
+		applies, so the module can still reach clients for other code to
+		require. Same cascade and override rules as ClientOnly.
 
 	Parallel (boolean)
-		Require the module inside its own Actor so its code can run in parallel.
+		Require the module inside its own Actor so its code can run in
+		parallel.
 
 	RelocateToServerScriptService (boolean)
-		Move a server-only module into ServerScriptService after it is required and leave
-		a pointer in its place. Hides server code from clients while keeping modules
-		organized inside shared containers.
-		Gotcha: the move happens after the require, so yielding in top-level code keeps the
-		module visible to clients for longer. Avoid yielding at the top level.
-		The pre-pass stamps ServerOnly onto marked modules so loader-driven clients filter
-		them out before the move; direct path requires from client code can still race it.
+		Move a server-only module into ServerScriptService after it is
+		required and leave a pointer in its place. Hides server code from
+		clients while keeping modules organized inside shared containers.
+		Gotcha: the move happens after the require, so yielding in top-level
+		code keeps the module visible to clients for longer. Avoid yielding at
+		the top level.
+		The pre-pass stamps ServerOnly onto marked modules so loader-driven
+		clients filter them out before the move; direct path requires from
+		client code can still race it.
 
 	RelocateToReplicatedStorage (boolean)
-		The inverse. Keep everything in ServerScriptService by default and expose only the
-		modules clients need. A server pre-pass moves the module into
-		ReplicatedStorage.RELOCATED_MODULES before any require runs, so the code is never
-		briefly visible to clients.
+		The inverse. Keep everything in ServerScriptService by default and
+		expose only the modules clients need. A server pre-pass moves the
+		module into ReplicatedStorage.RELOCATED_MODULES before any require
+		runs, so the code is never briefly visible to clients.
 
-		The folders between the container and the module are mirrored under that root, so
-		relative requires like require(script.Parent.Sibling) and string requires like
-		require("../Sibling") keep working when every endpoint is also relocated. A
-		pointer stays at the original location so server-side requires still resolve.
-		Each mirrored folder also receives a one-time snapshot of its original folder's
-		attributes, so a relocated module's script.Parent:GetAttribute(...) keeps working
-		(e.g. system config stored on a folder/package root).
+		The folders between the container and the module are mirrored under
+		that root, so relative requires like require(script.Parent.Sibling)
+		and string requires like require("../Sibling") keep working when every
+		endpoint is also relocated. A pointer stays at the original location
+		so server-side requires still resolve. Each mirrored folder also
+		receives a one-time snapshot of its original folder's attributes, so a
+		relocated module's script.Parent:GetAttribute(...) keeps working (e.g.
+		system config stored on a folder or package root).
 
-		Client rebuild (manifest-driven since v3.0.4):
-			The server writes a manifest of every relocated module to the _RelocationManifest
-			attribute before setting RelocationComplete. When the loader is first required on
-			a client (before Start), a bootstrap rebuilds each module's original
-			ServerScriptService path locally, with a pointer at the leaf that resolves to the
-			real module in ReplicatedStorage, so require(game.ServerScriptService.A.B.C)
-			resolves the same on client and server. The real module exists once, in
-			ReplicatedStorage. The bootstrap re-applies the manifest whenever it changes, so
-			a server that calls Start() late is still recovered.
+		Client rebuild:
+			The server writes a manifest of every relocated module to the
+			_RelocationManifest attribute before setting RelocationComplete.
+			When the loader is first required on a client (before Start), a
+			bootstrap rebuilds each module's original ServerScriptService path
+			locally, with a pointer at the leaf that resolves to the real
+			module in ReplicatedStorage, so require(game.ServerScriptService.A)
+			resolves the same on client and server. The real module exists
+			once, in ReplicatedStorage. The bootstrap re-applies the manifest
+			whenever it changes, so a server that calls Start() late is still
+			recovered.
 
-		Cascade: set on a Folder to relocate the whole subtree (folders discovered by a
-		container OR by LoaderTag).
-			A module's own value wins over an ancestor folder, closest folder wins among
-			nested folders. RelocateToReplicatedStorage = false on a module opts it out of
-			an ancestor's cascade while staying loadable on the server. RelocateToServerScriptService
-			= true opts out and hides it on the server instead. Only modules whose ancestry up
-			to the folder is made of Folders are relocated.
+		Client repair:
+			A relocated folder can fail to reach a joining client and never
+			arrive on its own. Right before discovery, a client that is still
+			missing relocated paths a few seconds into its check reports them
+			through RelocationRepairEvent, and the server detaches and
+			re-attaches each one so it replicates again. Clients that already
+			have it keep the same instance. The server takes one request of a
+			few paths per player, only before that player has loaded, acts
+			only on paths its own manifest produced that are small enough, and
+			resends one instance at a time, after its own load, at most once
+			per cooldown and a capped number of times per minute across all
+			players.
+			Discovery runs straight after a final check that does not yield,
+			so a resend for another player cannot drop modules from a loading
+			client's discovery. During the short detach, though, a relative
+			require that crosses the resent folder's boundary
+			(script.Parent.Parent.X, "../X") fails on every realm; pointers
+			wait it out. A client that does not wait for the server can finish
+			its check before a resend arrives, because resends wait for the
+			server's own load.
+
+		Cascade: set on a Folder to relocate the whole subtree (folders
+		discovered by a container OR by LoaderTag).
+			A module's own value wins over an ancestor folder, closest folder
+			wins among nested folders. RelocateToReplicatedStorage = false on
+			a module opts it out of an ancestor's cascade while staying
+			loadable on the server. RelocateToServerScriptService = true opts
+			out and hides it on the server instead. Only modules whose
+			ancestry up to the folder is made of Folders are relocated.
 
 		Gotchas:
-			Descendants of a relocated module (assets, child modules) move with it. Expose
-			them through the module's return table instead of indexing for them directly.
+			Descendants of a relocated module (assets, child modules) move
+			with it. Expose them through the module's return table instead of
+			indexing for them directly.
 
-			An opted-out, server-only sibling cannot be reached by a relative require on the
-			client, since it stays in ServerScriptService. Cross realms through the loader,
-			an absolute path, or a remote.
+			An opted-out, server-only sibling cannot be reached by a relative
+			require on the client, since it stays in ServerScriptService.
+			Cross realms through the loader, an absolute path, or a remote.
 
-			Setting both Relocate attributes on one module warns and skips it. A module
-			already in ReplicatedStorage also warns and is skipped.
+			Setting both Relocate attributes on one module warns and skips it.
+			A module already in ReplicatedStorage also warns and is skipped.
 
 	-- COLLECTION SERVICE --
-	Enable UseCollectionService and tag ModuleScripts or Folders with LoaderTag to load
-	modules that live outside the containers you pass in. Tagging a Folder loads every
-	descendant ModuleScript, subject to the filtering attributes above. Tags on a
-	relocated folder are mirrored into ReplicatedStorage so clients find the modules by
-	the same tag. A module that resolves to an already loaded value is deduplicated, so
-	Init and Start run once per result.
+	Enable UseCollectionService and tag ModuleScripts or Folders with
+	LoaderTag to load modules that live outside the containers you pass in.
+	Tagging a Folder loads every descendant ModuleScript, subject to the
+	filtering attributes above. Tags on a relocated folder are mirrored into
+	ReplicatedStorage so clients find the modules by the same tag.
 
 	-- LOADER SETTINGS --
-	Set as attributes on the ModuleLoader script. ChangeSettings() overrides them at runtime.
+	Set as attributes on the ModuleLoader script. ChangeSettings() overrides
+	them at runtime. A setting attribute of the wrong type logs a warning and
+	is ignored.
 
-	FolderSearchDepth (number, default 1)
-		How deep to search a container, where 1 is its direct children.
 	YieldThreshold (number, default 10)
 		Seconds a module may run before a slow-load warning logs.
-	VerboseLoading (boolean)
-		Log each step of the loading process.
+	VerboseLoading (boolean, default true)
+		Log each step of the loading process, and how long each phase took.
 	UseCollectionService (boolean)
 		Discover modules to load by LoaderTag.
 	LoaderTag (string, default LOAD_MODULE)
@@ -106,291 +154,360 @@
 		Client waits for persistent models to stream into workspace first.
 
 	-- DEFAULT FILTERING --
-	Start() loads a module only when its path back to the container is all folders and it
-	sits within FolderSearchDepth, and it respects ClientOnly, ServerOnly, and IgnoreLoader.
-	Pass your own predicate to StartCustom() to replace this behavior.
+	Start() loads every module whose path back to its container or tagged
+	folder is all folders, at any depth, and it respects ClientOnly,
+	ServerOnly, and IgnoreLoader. A module nested under another module belongs
+	to that module and is never loaded or relocated on its own. Pass your own
+	predicate to StartCustom() to replace this behavior.
+
+	-- EDIT MODE --
+	Outside a running game (the command bar, plugins, specs, UI Labs stories),
+	requiring the loader creates nothing in the place, connects nothing, and
+	never waits, so modules that require it can load there.
 
 	-- LOADER STATE (attributes on this script) --
 	RelocationComplete / _RelocationManifest
-		Written by the server when the relocation pre-pass finishes (manifest first). Clients
-		rebuild their local pointer tree from the manifest at require time and re-apply it on
-		change. Both attributes are cleared at server require time to guard against stale
-		values baked into a place file.
+		Written by the server when the relocation pre-pass finishes (manifest
+		first). Clients rebuild their local pointer tree from the manifest at
+		require time and re-apply it on change. Both attributes are cleared at
+		server require time to guard against stale values baked into a place
+		file.
 	ServerLoaded / ServerLoadedTimestamp
 		Read them through IsServerLoaded() and GetServerLoadedTimestamp().
-
-	Breaking change:
-		ServerLoaded and ServerLoadedTimestamp now live on this script instead of on workspace.
-		Code that read them from workspace must use the API methods.
 ]]
 
 -----------------------------
 -- SERVICES --
 -----------------------------
-local ReplicatedFirst = game:GetService("ReplicatedFirst")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local CollectionService = game:GetService("CollectionService")
-local ServerScriptService = game:GetService("ServerScriptService")
-local Players = game:GetService("Players")
-local HttpService = game:GetService("HttpService")
+const CollectionService = game:GetService("CollectionService")
+const HttpService = game:GetService("HttpService")
+const Players = game:GetService("Players")
+const ReplicatedFirst = game:GetService("ReplicatedFirst")
+const ReplicatedStorage = game:GetService("ReplicatedStorage")
+const RunService = game:GetService("RunService")
+const ServerScriptService = game:GetService("ServerScriptService")
 
 -----------------------------
--- VARIABLES --
+-- TYPES --
 -----------------------------
-local parallelModuleLoader = script.ParallelModuleLoader
-local actorForServer: Actor? = script:FindFirstChild("ActorForServer") :: any
-local actorForClient: Actor? = script:FindFirstChild("ActorForClient") :: any
-local isClient = RunService:IsClient()
-local isServer = RunService:IsServer()
-local require = require
-local loadedEvent: RemoteEvent
-if isClient then
-	loadedEvent = script:WaitForChild("LoadedEvent") :: RemoteEvent
-else
-	loadedEvent = Instance.new("RemoteEvent")
-	loadedEvent.Name = "LoadedEvent"
-	loadedEvent.Parent = script
-end
-
-local started = false
-
-local tracker = {
-	Load = {} :: { [ModuleScript]: any },
-	Init = {} :: { [ModuleScript]: boolean },
-	Start = {} :: { [ModuleScript]: boolean }
-}
-
-local trackerForActors = {
-	Load = {} :: { [ModuleScript]: Actor },
-	Init = {},
-	Start = {}
-}
-
--- Indexed by the table that a successful require() returned. Lets the loader
--- skip duplicate Init/Start when two ModuleScripts resolve to the same value
--- (most notably a relocation pointer and its real target both being discovered).
-local seenResults: { [any]: true } = {}
-
--- Client relocation state, owned by clientRelocationBootstrap (spawned at require time in MAIN).
--- start() only waits on these, so a late server Start() recovers in the background.
-local relocationManifest: { any }? = nil
-local relocationRebuildDone = false
-local relocationRebuildSignal = Instance.new("BindableEvent")
-
--- Actor VMs each have their own require() cache, so parallel modules dedup on the canonical
--- instance instead of the required value.
-local seenParallelTargets: { [ModuleScript]: true } = {}
-
 export type LoaderSettings = {
 	WAIT_FOR_PERSISTENT: boolean?,
-	FOLDER_SEARCH_DEPTH: number?,
 	YIELD_THRESHOLD: number?,
 	VERBOSE_LOADING: boolean?,
 	WAIT_FOR_SERVER: boolean?,
 	USE_COLLECTION_SERVICE: boolean?,
 }
 
-export type KeepModulePredicate = (container: Instance, module: ModuleScript) -> (boolean)
+export type KeepModulePredicate = (container: Instance, module: ModuleScript) -> boolean
 
--- One entry per relocated module, JSON-encoded into the _RelocationManifest attribute.
+-- One entry per relocated module, JSON-encoded into the _RelocationManifest
+-- attribute.
 type RelocationManifestEntry = {
-	RelocatedPath: string, -- dotted path under RELOCATED_MODULES (where the real module now lives)
-	ServerScriptServicePath: string?, -- original dotted path under ServerScriptService (nil when relocated from elsewhere)
-	Attributes: { [string]: any }?, -- loader-filter attributes mirrored onto rebuilt client pointers
-	DescendantCount: number?, -- subtree size at relocation time (nil when zero), so clients can await the full subtree
+	-- Dotted path under RELOCATED_MODULES, where the real module now lives.
+	RelocatedPath: string,
+	-- Original dotted path under ServerScriptService, nil when relocated from
+	-- elsewhere.
+	ServerScriptServicePath: string?,
+	-- Loader-filter attributes mirrored onto rebuilt client pointers.
+	Attributes: { [string]: any }?,
+	-- Subtree size at relocation time (nil when zero), so clients can await
+	-- the full subtree.
+	DescendantCount: number?,
 }
 
--- CONSTANTS --
-local SETTINGS: LoaderSettings = {
-	WAIT_FOR_PERSISTENT = script:GetAttribute("ClientWaitForPersistentLoaded") == true or false,
-	FOLDER_SEARCH_DEPTH = (script:GetAttribute("FolderSearchDepth") :: number?) or 1,
-	YIELD_THRESHOLD = (script:GetAttribute("YieldThreshold") :: number?) or 10, -- how long until the module starts warning for a module that is taking too long
-	VERBOSE_LOADING = script:GetAttribute("VerboseLoading") == true or false,
-	WAIT_FOR_SERVER = script:GetAttribute("ClientWaitForServer") == true or false,
-	USE_COLLECTION_SERVICE = script:GetAttribute("UseCollectionService") == true or false,
+type PendingResend = {
+	Player: Player,
+	Path: string,
 }
 
-local PRINT_IDENTIFIER = if isClient then "[C]" else "[S]"
-local LOADED_IDENTIFIER = if isClient then "Client" else "Server"
-local ACTOR_PARENT = if isClient then (Players.LocalPlayer :: Player).PlayerScripts else game:GetService("ServerScriptService")
-local TAG: string = (script:GetAttribute("LoaderTag") :: string?) or "LOAD_MODULE"
-local RELOCATED_MODULES do
-	if RunService:IsServer() then
-		RELOCATED_MODULES = Instance.new("Folder")
-		RELOCATED_MODULES.Name = "RELOCATED_MODULES"
-		RELOCATED_MODULES.Parent = ServerScriptService
-	end
-end
-if isServer then
-	-- Attributes copied out of a running play session survive in the place file; stale relocation
-	-- state would make clients skip the gate before the real pre-pass runs.
-	script:SetAttribute("RelocationComplete", nil)
-	script:SetAttribute("_RelocationManifest", nil)
-end
--- Lazily created on the server only when the first RelocateToReplicatedStorage target is
--- encountered, so games that don't use the feature never pay for the folder (and clients see an
--- empty relocation manifest instead of an empty folder).
-local REPLICATED_RELOCATED_MODULES: Folder? = nil
-local function ensureReplicatedRelocatedFolder(): Folder
-	local cached = REPLICATED_RELOCATED_MODULES
-	if cached then
-		return cached
-	end
-	local existing = ReplicatedStorage:FindFirstChild("RELOCATED_MODULES")
-	local folder: Folder
-	if existing and existing:IsA("Folder") then
-		folder = existing :: Folder
-	else
-		if existing then
-			-- Clients resolve RELOCATED_MODULES by name, so a same-named squatter makes every
-			-- pointer walk ambiguous.
-			warn(
-				PRINT_IDENTIFIER,
-				`'{existing:GetFullName()}' occupies the name RELOCATED_MODULES in ReplicatedStorage; relocated paths may resolve against the wrong instance. Rename or remove it.`
-			)
-		end
-		folder = Instance.new("Folder")
-		folder.Name = "RELOCATED_MODULES"
-		folder.Parent = ReplicatedStorage
-	end
-	REPLICATED_RELOCATED_MODULES = folder
-	return folder
-end
+type LifecycleMethodName = "Init" | "Start"
 
+type LifecycleStep = {
+	-- Names the call in the slow-call warning, e.g. "Loading Module 'Foo'".
+	Description: string,
+	MemoryCategory: string,
+	Run: () -> (),
+	-- Called once if Run yields instead of returning straight away.
+	OnYield: (() -> ())?,
+}
+
+type LifecycleLogWords = {
+	Running: string,
+	Finished: string,
+	Verb: string,
+}
+
+-----------------------------
+-- VARIABLES --
+-----------------------------
+local Module = {}
+
+const DEFAULT_LOADER_TAG = "LOAD_MODULE"
+const DEFAULT_YIELD_THRESHOLD = 10
+const DEFAULT_VERBOSE_LOADING = true
+-- Keep in sync with RelocatedTemplate, which finds the folder by this name.
+const RELOCATED_FOLDER_NAME = "RELOCATED_MODULES"
+const SLOW_CALL_WARNING_INTERVAL = 5
+const REPLICATION_POLL_INTERVAL = 0.1
+-- A pointer can point at another pointer; resolution stops after this many
+-- hops.
+const MAX_POINTER_HOPS = 4
+-- Seconds a client waits for the server's relocation manifest, then for the
+-- relocated modules themselves, before it loads anyway.
+const RELOCATION_MANIFEST_WAIT_CAP = 15
+const RELOCATED_TREE_WAIT_CAP = 15
+const PRINT_IDENTIFIER = if RunService:IsClient() then "[C]" else "[S]"
+const LOADED_IDENTIFIER = if RunService:IsClient() then "Client" else "Server"
+const LIFECYCLE_METHODS: { LifecycleMethodName } = { "Init", "Start" }
+const LIFECYCLE_LOG_WORDS: { [LifecycleMethodName]: LifecycleLogWords } = {
+	Init = {
+		Running = "Initializing",
+		Finished = "Initialized",
+		Verb = "init",
+	},
+	Start = {
+		Running = "Starting",
+		Finished = "Started",
+		Verb = "start",
+	},
+}
+-- Copied from a relocated module onto its pointers. Without them, the load
+-- pass would treat a pointer differently than its module (the server would
+-- load a ClientOnly module through its unfiltered pointer).
+const POINTER_ATTRIBUTES = {
+	"ClientOnly",
+	"ServerOnly",
+	"IgnoreLoader",
+	"LoaderPriority",
+	"Parallel",
+}
+-- What a loader flag holding a non-boolean counts as. A stray "true" string
+-- must keep a module on the server, never send it to clients.
+const MISTYPED_FLAG_VALUES: { [string]: boolean } = {
+	ClientOnly = true,
+	IgnoreLoader = true,
+	Parallel = true,
+	RelocateToReplicatedStorage = false,
+	RelocateToServerScriptService = true,
+	ServerOnly = true,
+}
+-- Seconds a client waits for relocated modules before asking the server to
+-- resend the missing ones. The rest of the client's wait cap is left for the
+-- resend to arrive.
+const RELOCATION_REPAIR_DELAY = 5
+-- Limits on what one client can make the server resend. A resend briefly
+-- detaches an instance for every player, so a client must not be able to
+-- trigger it at will. The loader itself sends at most one request per
+-- session.
+const RELOCATION_REPAIR_MAX_REQUESTS = 1
+const RELOCATION_REPAIR_MAX_PATHS = 10
+const RELOCATION_REPAIR_MAX_DESCENDANTS = 1000
+const RELOCATION_REPAIR_COOLDOWN = 10
+const RELOCATION_REPAIR_MAX_RESENDS_PER_WINDOW = 20
+const RELOCATION_REPAIR_RATE_WINDOW = 60
+-- Long enough that the detach and the re-attach replicate as two changes
+-- instead of canceling out within one network send.
+const RELOCATION_REPAIR_DETACH_TIME = 0.25
+
+local isClient = RunService:IsClient()
+local isServer = RunService:IsServer()
+local isRunning = RunService:IsRunning()
+-- A local alias keeps the type checker from trying to resolve requires of
+-- modules found at runtime.
+local require = require
+
+local parallelModuleLoader = script.ParallelModuleLoader
+local relocatedTemplate: ModuleScript? = script:FindFirstChild("RelocatedTemplate") :: any
+local actorForServer: Actor? = script:FindFirstChild("ActorForServer") :: any
+local actorForClient: Actor? = script:FindFirstChild("ActorForClient") :: any
+local loadedEvent: RemoteEvent
+local relocationRepairEvent: RemoteEvent
+
+local settings: LoaderSettings = {}
+local loaderTag = DEFAULT_LOADER_TAG
+local customKeepModule: KeepModulePredicate? = nil
+local started = false
+
+local tracker = {
+	Load = {} :: { [ModuleScript]: any },
+	Init = {} :: { [ModuleScript]: boolean },
+	Start = {} :: { [ModuleScript]: boolean },
+}
+local actorsByModule: { [ModuleScript]: Actor } = {}
+
+-- Indexed by the table that a successful require() returned. Lets the loader
+-- skip duplicate Init/Start when two ModuleScripts resolve to the same value
+-- (most notably a relocation pointer and its real target both being
+-- discovered).
+local seenResults: { [any]: true } = {}
+
+-- Init/Start functions defined directly on a loaded table, not reached
+-- through a metatable.
+local ownedLifecycleMethods: { [any]: true } = {}
+
+-- Actor VMs each have their own require() cache, so parallel modules dedup on
+-- the canonical instance instead of the required value.
+local seenParallelTargets: { [ModuleScript]: true } = {}
+
+-- Keyed by "<instance path>.<attribute>", so each mistyped attribute warns
+-- once.
+local warnedMistypedAttributes: { [string]: true } = {}
+
+-- Created on first use, so games that never relocate get no folders.
+local replicatedRelocatedFolder: Folder? = nil
+local serverRelocatedFolder: Folder? = nil
+
+-- Client relocation state, owned by clientRelocationBootstrap (spawned at
+-- require time in MAIN). Start only waits on these, so a late server Start()
+-- recovers in the background.
+local relocationManifest: { RelocationManifestEntry }? = nil
+local relocationRebuildDone = false
+local relocationRebuildSignal = Instance.new("BindableEvent")
+
+-- Server relocation-repair state. resendablePaths holds every dotted path the
+-- pre-pass produced (each relocated module and each mirrored folder above
+-- it), true when the subtree is small enough to resend. Resends run one at a
+-- time from pendingResends.
+local resendablePaths: { [string]: boolean } = {}
+local repairRequestsByPlayer: { [Player]: number } = {}
+local lastResendTimes: { [Instance]: number } = {}
+local pendingResends: { PendingResend } = {}
+local recentResendTimes: { number } = {}
+local isResendWorkerRunning = false
 
 -----------------------------
 -- PRIVATE FUNCTIONS --
 -----------------------------
 
+local function newPrint(...: any)
+	print(PRINT_IDENTIFIER, ...)
+end
+
+local function newWarn(...: any)
+	warn(PRINT_IDENTIFIER, ...)
+end
+
+local function formatSeconds(seconds: number): string
+	return string.format("%.3f", seconds)
+end
+
 --[[
-	Yields until either signal fires.
+	Reads a boolean loader attribute. A value of any other type warns once and
+	counts as its MISTYPED_FLAG_VALUES entry, so a typo can never ship server
+	code to clients.
 ]]
-local function waitForEither<Func, T...>(eventYes: RBXScriptSignal, eventNo: RBXScriptSignal): boolean
+local function readFlag(instance: Instance, attributeName: string): boolean?
+	local value = instance:GetAttribute(attributeName)
+	if value == nil or typeof(value) == "boolean" then
+		return value :: boolean?
+	end
+
+	local fallback = MISTYPED_FLAG_VALUES[attributeName]
+	local warningKey = `{instance:GetFullName()}.{attributeName}`
+	if not warnedMistypedAttributes[warningKey] then
+		warnedMistypedAttributes[warningKey] = true
+		newWarn(
+			`Loader attribute {attributeName} on '{instance:GetFullName()}' is a {typeof(value)},`,
+			`not a boolean; treating it as {fallback}.`
+		)
+	end
+	return fallback
+end
+
+--[[
+	Reads one loader setting attribute. A value of the wrong type warns and
+	counts as unset.
+]]
+local function readSettingAttribute(attributeName: string, expectedType: string): any
+	local value = script:GetAttribute(attributeName)
+	if value == nil or typeof(value) == expectedType then
+		return value
+	end
+
+	newWarn(
+		`ModuleLoader setting {attributeName} is a {typeof(value)}, not a {expectedType};`,
+		"ignoring it."
+	)
+	return nil
+end
+
+--[[
+	Reads a module's LoaderPriority. A value that is not a number would break
+	the load-order sort and stop every module from loading, so it warns and
+	counts as 0 instead.
+]]
+local function getLoaderPriority(module: ModuleScript): number
+	local priority = module:GetAttribute("LoaderPriority")
+	if priority == nil then
+		return 0
+	end
+	-- NaN fails every comparison, which breaks the sort just the same.
+	if typeof(priority) ~= "number" or priority ~= priority then
+		newWarn(`LoaderPriority on '{module:GetFullName()}' is not a number; treating it as 0.`)
+		return 0
+	end
+	return priority
+end
+
+--[[
+	Returns one of the loader's remotes: made by the server, awaited by
+	clients. Outside a running game it stays unparented, so requiring the
+	loader there leaves nothing in the place and waits on nothing.
+]]
+local function getLoaderRemoteAsync(name: string): RemoteEvent
+	if isRunning and isClient then
+		return script:WaitForChild(name) :: RemoteEvent
+	end
+
+	local remote = Instance.new("RemoteEvent")
+	remote.Name = name
+	if isRunning then
+		remote.Parent = script
+	end
+	return remote
+end
+
+local function waitForAttributeAsync(instance: Instance, attributeName: string)
+	while not instance:GetAttribute(attributeName) do
+		instance:GetAttributeChangedSignal(attributeName):Wait()
+	end
+end
+
+--[[
+	Yields until either signal fires. Returns true when <code>eventYes</code>
+	fired first, followed by that signal's arguments.
+]]
+local function waitForEither(eventYes: RBXScriptSignal, eventNo: RBXScriptSignal): boolean
 	local thread = coroutine.running()
+	local yesConnection: RBXScriptConnection? = nil
+	local noConnection: RBXScriptConnection? = nil
 
-	local connection1: any = nil
-	local connection2: any = nil
-
-	connection1 = eventYes:Once(function(...)
-		if connection1 == nil then
+	local function finish(result: boolean, ...: any)
+		if not yesConnection or not noConnection then
 			return
 		end
-
-		connection1:Disconnect()
-		connection2:Disconnect()
-		connection1 = nil
-		connection2 = nil
-
-		if coroutine.status(thread) == "suspended" then
-			task.spawn(thread, true, ...)
-		end
-	end)
-
-	connection2 = eventNo:Once(function(...)
-		if connection2 == nil then
-			return
-		end
-
-		connection1:Disconnect()
-		connection2:Disconnect()
-		connection1 = nil
-		connection2 = nil
+		yesConnection:Disconnect()
+		noConnection:Disconnect()
+		yesConnection = nil
+		noConnection = nil
 
 		if coroutine.status(thread) == "suspended" then
-			task.spawn(thread, false, ...)
+			task.spawn(thread, result, ...)
 		end
-	end)
+	end
 
+	yesConnection = eventYes:Once(function(...)
+		finish(true, ...)
+	end)
+	noConnection = eventNo:Once(function(...)
+		finish(false, ...)
+	end)
 	return coroutine.yield()
 end
 
-local function copy<T>(t: T, deep: boolean?): T
-	if not deep then
-		return (table.clone(t :: any) :: any) :: T
-	end
-	local function deepCopy(object: any)
-		assert(typeof(object) == "table", "Expected table for deepCopy!")
-		-- Returns a deep copy of the provided table.
-		local newObject = setmetatable({}, getmetatable(object)) :: any -- Clone metaData
-
-		for index: any, value: any in object do
-			if typeof(value) == "table" then
-				newObject[index] = deepCopy(value)
-				continue
-			end
-
-			newObject[index] = value
-		end
-
-		return newObject
-	end
-	return deepCopy(t :: any) :: T
-end
-
-local function reconcile<S, T>(src: S, template: T): S & T
-	assert(type(src) == "table", "First argument must be a table")
-	assert(type(template) == "table", "Second argument must be a table")
-
-	local tbl = table.clone(src) :: any
-
-	for k, v in (template :: any) do
-		local sv = (src :: any)[k]
-		if sv == nil then
-			if type(v) == "table" then
-				tbl[k] = copy(v, true)
-			else
-				tbl[k] = v
-			end
-		elseif type(sv) == "table" then
-			if type(v) == "table" then
-				tbl[k] = reconcile(sv, v)
-			else
-				tbl[k] = copy(sv, true)
-			end
-		end
-	end
-
-	return (tbl :: any) :: S & T
-end
-
 --[[
-	Returns a new array that is the result of array1 and array2
-]]
-local function mergeArrays(array1: {[number]: any}, array2: {[number]: any})
-	local length = #array2
-	local newArray = table.clone(array2)
-	for i, v in ipairs(array1) do
-		newArray[length + i] = v
-	end
-	return newArray
-end
-
-local function filter<T>(t: { T }, predicate: (T, any, { T }) -> boolean): { T }
-	assert(type(t) == "table", "First argument must be a table")
-	assert(type(predicate) == "function", "Second argument must be a function")
-	local newT = table.create(#t)
-	if #t > 0 then
-		local n = 0
-		for i, v in t do
-			if predicate(v, i, t) then
-				n += 1
-				newT[n] = v
-			end
-		end
-	else
-		for k, v in t do
-			if predicate(v, k, t) then
-				newT[k] = v
-			end
-		end
-	end
-	return newT
-end
-
---[[
-	Returns the 'depth' of <code>descendant</code> in the child hierarchy of <code>root</code>.
-	If the descendant is not found in <code>root</code>, then this function will return 0.
+	Returns the 'depth' of <code>descendant</code> in the child hierarchy of
+	<code>root</code>, or 0 if the descendant is not found in <code>root</code>.
 ]]
 local function getDepthInHierarchy(descendant: Instance, root: Instance): number
 	local depth = 0
@@ -400,60 +517,51 @@ local function getDepthInHierarchy(descendant: Instance, root: Instance): number
 		depth += 1
 	end
 	if not current then
-		depth = 0
+		return 0
 	end
 	return depth
 end
 
-local function findAllFromClass(class: string, searchIn: Instance, searchDepth: number?): { any }
-	assert(class and typeof(class) == "string", "class is invalid or nil")
-	assert(searchIn and typeof(searchIn) == "Instance", "searchIn is invalid or nil")
-
+local function findAllFromClass(className: string, searchIn: Instance): { any }
 	local foundObjects = {}
-
-	if searchDepth then
-		for _, object in pairs(searchIn:GetDescendants()) do
-			if object:IsA(class) and getDepthInHierarchy(object, searchIn) <= searchDepth then
-				table.insert(foundObjects, object)
-			end
-		end
-	else
-		for _, object in pairs(searchIn:GetDescendants()) do
-			if object:IsA(class) then
-				table.insert(foundObjects, object)
-			end
+	for _, descendant in searchIn:GetDescendants() do
+		if descendant:IsA(className) then
+			table.insert(foundObjects, descendant)
 		end
 	end
-
 	return foundObjects
 end
 
+--[[
+	The default filter. Keeps a module whose path back to
+	<code>container</code> is all Folders, unless ClientOnly, ServerOnly, or
+	IgnoreLoader rule it out on this realm. A value set on the module itself
+	(even false) wins over the cascade, and the closest Folder wins within it.
+]]
 local function keepModule(container: Instance, module: ModuleScript): boolean
-	-- ClientOnly / ServerOnly / IgnoreLoader cascade from Folder ancestors. A value
-	-- set directly on the module (including explicit `false`) wins over the cascade;
-	-- within the ancestor chain, the closest Folder with a non-nil value wins.
-	local clientOnly: any = module:GetAttribute("ClientOnly")
-	local serverOnly: any = module:GetAttribute("ServerOnly")
-	local ignore: any = module:GetAttribute("IgnoreLoader")
+	local clientOnly = readFlag(module, "ClientOnly")
+	local serverOnly = readFlag(module, "ServerOnly")
+	local ignore = readFlag(module, "IgnoreLoader")
 
 	local ancestor: Instance? = module.Parent
 	local foundContainer = false
 	while ancestor do
 		if ancestor:IsA("Folder") then
 			if clientOnly == nil then
-				clientOnly = ancestor:GetAttribute("ClientOnly")
+				clientOnly = readFlag(ancestor, "ClientOnly")
 			end
 			if serverOnly == nil then
-				serverOnly = ancestor:GetAttribute("ServerOnly")
+				serverOnly = readFlag(ancestor, "ServerOnly")
 			end
 			if ignore == nil then
-				ignore = ancestor:GetAttribute("IgnoreLoader")
+				ignore = readFlag(ancestor, "IgnoreLoader")
 			end
 		end
 		if ancestor == container then
 			foundContainer = true
 			break
-		elseif not ancestor:IsA("Folder") then
+		end
+		if not ancestor:IsA("Folder") then
 			return false
 		end
 		ancestor = ancestor.Parent
@@ -462,30 +570,18 @@ local function keepModule(container: Instance, module: ModuleScript): boolean
 		return false
 	end
 
-	if clientOnly and RunService:IsServer() then
-		return false
-	elseif serverOnly and RunService:IsClient() then
-		return false
-	elseif ignore then
+	if clientOnly and isServer then
 		return false
 	end
-	return true
+	if serverOnly and isClient then
+		return false
+	end
+	return not ignore
 end
-
-local function newPrint(...)
-	print(PRINT_IDENTIFIER, ...)
-end
-
-local function newWarn(...)
-	warn(PRINT_IDENTIFIER, ...)
-end
-
------------------------------
--- RELOCATION HELPERS --
------------------------------
 
 --[[
-	Returns the dot-separated path from <code>module</code> up to (but excluding) <code>container</code>.
+	Returns the dot-separated path from <code>module</code> up to (but
+	excluding) <code>container</code>.
 ]]
 local function getDottedPathToContainer(module: Instance, container: Instance): string
 	local segments = { module.Name }
@@ -498,10 +594,12 @@ local function getDottedPathToContainer(module: Instance, container: Instance): 
 end
 
 --[[
-	Returns the dot-separated path from <code>service</code> (exclusive) down to <code>instance</code>
-	(inclusive), e.g. "Gameplay.Combat.DamageMath". Returns <code>nil</code> if <code>instance</code>
-	is not a descendant of <code>service</code>. Unlike getDottedPathToContainer this anchors to a
-	service so the client can rebuild the full original hierarchy under its own local ServerScriptService.
+	Returns the dot-separated path from <code>service</code> (exclusive) down
+	to <code>instance</code> (inclusive), e.g. "Gameplay.Combat.DamageMath", or
+	<code>nil</code> if <code>instance</code> is not a descendant of
+	<code>service</code>. Unlike getDottedPathToContainer this anchors to a
+	service, so the client can rebuild the full original hierarchy under its
+	own local ServerScriptService.
 ]]
 local function getDottedPathFromService(instance: Instance, service: Instance): string?
 	local segments = { instance.Name }
@@ -517,23 +615,26 @@ local function getDottedPathFromService(instance: Instance, service: Instance): 
 end
 
 --[[
-	Client-only: FindFirstChild-or-creates a plain Folder for each segment under <code>root</code>,
-	mirroring an original ServerScriptService folder chain. Returns the deepest folder (or
-	<code>root</code> itself if <code>segments</code> is empty). These folders are passive scaffolding
-	for relocated-module pointers, so no tags/attributes are mirrored onto them.
+	Client only: finds or creates a plain Folder for each segment under
+	<code>root</code>, mirroring an original ServerScriptService folder chain.
+	Returns the deepest folder (or <code>root</code> itself if
+	<code>segments</code> is empty). These folders only hold relocated-module
+	pointers, so no tags or attributes are mirrored onto them.
 ]]
 local function getOrCreateClientFolderPath(root: Instance, segments: { string }): Instance
 	local current: Instance = root
-	for _, name in ipairs(segments) do
+	for _, name in segments do
 		local existing = current:FindFirstChild(name)
 		if existing and existing:IsA("Folder") then
 			current = existing
 			continue
 		end
 		if existing then
-			-- Requires resolve by name alone, so paths through this segment are ambiguous.
+			-- Requires resolve by name alone, so paths through this segment are
+			-- ambiguous.
 			newWarn(
-				`Rebuilt ServerScriptService path segment '{name}' collides with existing non-Folder '{existing:GetFullName()}'; creating a duplicate-named sibling Folder.`
+				`Rebuilt ServerScriptService path segment '{name}' collides with existing`,
+				`non-Folder '{existing:GetFullName()}'; creating a duplicate-named sibling Folder.`
 			)
 		end
 		local folder = Instance.new("Folder")
@@ -545,22 +646,26 @@ local function getOrCreateClientFolderPath(root: Instance, segments: { string })
 end
 
 --[[
-	Given the ordered list of original ancestor folders (outermost to innermost,
-	exclusive of both the container and the module itself), creates or reuses
-	Folder instances under <code>rootFolder</code> to mirror the chain. Returns the deepest
-	mirrored folder (or <code>rootFolder</code> itself if <code>ancestor</code> is empty).
+	Given the ordered list of original ancestor folders (outermost to
+	innermost, excluding both the container and the module itself), creates or
+	reuses Folder instances under <code>rootFolder</code> to mirror the chain.
+	Returns the deepest mirrored folder (or <code>rootFolder</code> itself if
+	<code>ancestors</code> is empty).
 ]]
 local function getOrCreateMirroredParent(rootFolder: Folder, ancestors: { Instance }): Folder
 	local current: Folder = rootFolder
-	for _, original in ipairs(ancestors) do
+	for _, original in ancestors do
 		local existing = current:FindFirstChild(original.Name)
 		if existing and existing:IsA("Folder") then
 			current = existing :: Folder
 		else
 			if existing then
-				-- Pointer paths resolve by name, so requires through this segment are ambiguous.
+				-- Pointer paths resolve by name, so requires through this
+				-- segment are ambiguous.
 				newWarn(
-					`Mirror folder '{original.Name}' collides with existing non-Folder '{existing:GetFullName()}' under RELOCATED_MODULES; creating a duplicate-named sibling.`
+					`Mirror folder '{original.Name}' collides with existing non-Folder`,
+					`'{existing:GetFullName()}' under RELOCATED_MODULES;`,
+					"creating a duplicate-named sibling."
 				)
 			end
 			local folder = Instance.new("Folder")
@@ -568,16 +673,21 @@ local function getOrCreateMirroredParent(rootFolder: Folder, ancestors: { Instan
 			folder.Parent = current
 			current = folder
 		end
-		-- Clients cannot see the SSS original, so they discover relocated modules through the
-		-- mirrored tag instead.
-		if SETTINGS.USE_COLLECTION_SERVICE and TAG ~= "" and CollectionService:HasTag(original, TAG) then
-			if not CollectionService:HasTag(current, TAG) then
-				CollectionService:AddTag(current, TAG)
-			end
+		-- Clients cannot see the ServerScriptService original, so they discover
+		-- relocated modules through the mirrored tag instead.
+		if
+			settings.USE_COLLECTION_SERVICE
+			and loaderTag ~= ""
+			and CollectionService:HasTag(original, loaderTag)
+			and not CollectionService:HasTag(current, loaderTag)
+		then
+			CollectionService:AddTag(current, loaderTag)
 		end
-		-- Snapshot the original folder's attributes so script.Parent:GetAttribute(...) and the
-		-- cascade attributes keep working after relocation. The loader's own flags are skipped,
-		-- and already-set values are kept so a mirror shared by siblings is not re-stomped.
+		-- Snapshot the original folder's attributes so
+		-- script.Parent:GetAttribute(...) and the cascade attributes keep
+		-- working after relocation. The loader's own flags are skipped, and
+		-- values already set are kept so a mirror shared by siblings is not
+		-- re-stomped.
 		for name, value in original:GetAttributes() do
 			if name == "RelocateToReplicatedStorage" or name == "RelocateToServerScriptService" then
 				continue
@@ -591,8 +701,9 @@ local function getOrCreateMirroredParent(rootFolder: Folder, ancestors: { Instan
 end
 
 --[[
-	Follows relocation-pointer attributes (non-yielding) to the real module. Returns the module
-	itself when it isn't a pointer or when the target hasn't replicated/resolved yet.
+	Follows relocation-pointer attributes (without yielding) to the real
+	module. Returns the module itself when it isn't a pointer or when the
+	target hasn't replicated or resolved yet.
 ]]
 local function resolveRelocationTarget(module: ModuleScript, depth: number?): ModuleScript
 	local serviceName = module:GetAttribute("_RelocatedService")
@@ -607,43 +718,50 @@ local function resolveRelocationTarget(module: ModuleScript, depth: number?): Mo
 	if not service then
 		return module
 	end
-	local current: Instance? = service:FindFirstChild("RELOCATED_MODULES")
+
+	local current: Instance? = service:FindFirstChild(RELOCATED_FOLDER_NAME)
 	for segment in string.gmatch(path, "[^%.]+") do
 		if not current then
 			return module
 		end
 		current = current:FindFirstChild(segment)
 	end
-	if current and current:IsA("ModuleScript") and current ~= module then
-		if (depth or 0) >= 4 then
-			return current :: ModuleScript
-		end
-		return resolveRelocationTarget(current :: ModuleScript, (depth or 0) + 1)
+	if not current or not current:IsA("ModuleScript") or current == module then
+		return module
 	end
-	return module
+	local hops = depth or 0
+	if hops >= MAX_POINTER_HOPS then
+		return current :: ModuleScript
+	end
+	return resolveRelocationTarget(current :: ModuleScript, hops + 1)
 end
 
 --[[
-	Returns true if <code>module</code> should be relocated to ReplicatedStorage. Mirrors keepModule's
-	cascade precedence: the module's own RelocateToReplicatedStorage value (including an explicit
-	<code>false</code>) wins, then the closest Folder ancestor up to and including <code>container</code>.
-	The ancestry up to <code>container</code> must be made of Folders only -- a module nested under a
-	non-folder (e.g. a child of another module) is not an independent relocation target; it moves with
-	its parent. Returns false if <code>container</code> is never reached.
+	Returns true if <code>module</code> should be relocated to
+	ReplicatedStorage. Mirrors keepModule's cascade precedence: the module's
+	own RelocateToReplicatedStorage value (including an explicit
+	<code>false</code>) wins, then the closest Folder ancestor up to and
+	including <code>container</code>. The ancestry up to
+	<code>container</code> must be made of Folders only: a module nested under
+	a non-folder (e.g. a child of another module) is not an independent
+	relocation target; it moves with its parent. Returns false if
+	<code>container</code> is never reached.
 ]]
 local function isMarkedForReplicatedRelocation(module: ModuleScript, container: Instance): boolean
-	local effective: any = module:GetAttribute("RelocateToReplicatedStorage")
+	local effective = readFlag(module, "RelocateToReplicatedStorage")
 	local ancestor: Instance? = module.Parent
 	local foundContainer = false
 	while ancestor do
 		if ancestor:IsA("Folder") and effective == nil then
-			effective = ancestor:GetAttribute("RelocateToReplicatedStorage")
+			effective = readFlag(ancestor, "RelocateToReplicatedStorage")
 		end
 		if ancestor == container then
-			-- Read the container's own value (above) before stopping; never walk past it.
+			-- Read the container's own value (above) before stopping; never
+			-- walk past it.
 			foundContainer = true
 			break
-		elseif not ancestor:IsA("Folder") then
+		end
+		if not ancestor:IsA("Folder") then
 			return false
 		end
 		ancestor = ancestor.Parent
@@ -655,19 +773,20 @@ local function isMarkedForReplicatedRelocation(module: ModuleScript, container: 
 end
 
 --[[
-	Returns true if <code>module</code> sits under a Folder marked RelocateToReplicatedStorage, in which
-	case a RelocateToServerScriptService attribute on it is acting as a cascade opt-out (intentionally
-	keeping the module on the server) rather than a redundant request to move an already-server module
-	into ServerScriptService. The closest Folder ancestor with the attribute set wins, mirroring the
-	cascade precedence used elsewhere.
+	Returns true if <code>module</code> sits under a Folder marked
+	RelocateToReplicatedStorage, in which case a RelocateToServerScriptService
+	attribute on it is a cascade opt-out (keeping the module on the server on
+	purpose) rather than a redundant request to move a module that is already
+	on the server. The closest Folder ancestor with the attribute set wins,
+	matching the cascade precedence used elsewhere.
 ]]
 local function isOptingOutOfReplicatedRelocation(module: Instance): boolean
 	local ancestor: Instance? = module.Parent
 	while ancestor do
 		if ancestor:IsA("Folder") then
-			local value = ancestor:GetAttribute("RelocateToReplicatedStorage")
+			local value = readFlag(ancestor, "RelocateToReplicatedStorage")
 			if value ~= nil then
-				return value == true
+				return value
 			end
 		end
 		ancestor = ancestor.Parent
@@ -675,20 +794,90 @@ local function isOptingOutOfReplicatedRelocation(module: Instance): boolean
 	return false
 end
 
+local function findOrCreateRelocatedFolder(service: Instance): Folder
+	local existing = service:FindFirstChild(RELOCATED_FOLDER_NAME)
+	if existing and existing:IsA("Folder") then
+		return existing :: Folder
+	end
+	if existing then
+		-- Pointers resolve RELOCATED_MODULES by name, so a same-named squatter
+		-- makes every pointer walk ambiguous.
+		newWarn(
+			`'{existing:GetFullName()}' occupies the name RELOCATED_MODULES in {service.Name};`,
+			"relocated paths may resolve against the wrong instance. Rename or remove it."
+		)
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = RELOCATED_FOLDER_NAME
+	folder.Parent = service
+	return folder
+end
+
 --[[
-	Relocates a single module to ReplicatedStorage.RELOCATED_MODULES if eligible, leaving a
-	hierarchy-aware pointer behind. <code>container</code> is the discovery boundary the mirror is
-	built relative to. <code>seen</code> guards modules reachable through multiple discovery routes;
-	only container-independent outcomes mark it, so a route that fails eligibility can be retried by
-	a later valid one. Successful relocations append a <code>manifest</code> entry for the client
-	rebuild. Returns the (possibly newly created) <code>destination</code> folder so lazy creation
+	Returns ReplicatedStorage.RELOCATED_MODULES, creating it when the first
+	module relocates there, so clients of a game that never relocates see an
+	empty manifest instead of an empty folder.
+]]
+local function ensureReplicatedRelocatedFolder(): Folder
+	local folder = replicatedRelocatedFolder or findOrCreateRelocatedFolder(ReplicatedStorage)
+	replicatedRelocatedFolder = folder
+	return folder
+end
+
+local function ensureServerRelocatedFolder(): Folder
+	local folder = serverRelocatedFolder or findOrCreateRelocatedFolder(ServerScriptService)
+	serverRelocatedFolder = folder
+	return folder
+end
+
+local function getRelocatedTemplate(): ModuleScript
+	assert(relocatedTemplate, "ModuleLoader missing RelocatedTemplate child")
+	return relocatedTemplate
+end
+
+local function createPointer(
+	template: Instance,
+	name: string,
+	serviceName: string,
+	relocatedPath: string
+): Instance
+	local pointer = template:Clone()
+	pointer.Name = name
+	pointer:SetAttribute("_RelocatedService", serviceName)
+	pointer:SetAttribute("_RelocatedPath", relocatedPath)
+	return pointer
+end
+
+--[[
+	Reads an attribute to copy from a module onto its pointers, already
+	interpreted the way the loader reads it, so a mistyped value warns once
+	for the module instead of again for every pointer.
+]]
+local function readPointerAttribute(module: ModuleScript, attributeName: string): any
+	if attributeName ~= "LoaderPriority" then
+		return readFlag(module, attributeName)
+	end
+	local priority = module:GetAttribute(attributeName)
+	return if typeof(priority) == "number" then priority else nil
+end
+
+--[[
+	Relocates a single module to ReplicatedStorage.RELOCATED_MODULES if
+	eligible, leaving a hierarchy-aware pointer behind. <code>container</code>
+	is the discovery boundary the mirror is built relative to.
+	<code>seen</code> guards modules reachable through multiple discovery
+	routes; only container-independent outcomes mark it, so a route that fails
+	eligibility can be retried by a later valid one. Successful relocations
+	append a <code>manifest</code> entry for the client rebuild. Returns the
+	(possibly newly created) <code>destination</code> folder so lazy creation
 	threads across calls.
 ]]
 local function tryRelocateModule(
 	module: ModuleScript,
 	container: Instance,
 	seen: { [ModuleScript]: true },
-	relocatedTemplate: Instance,
+	template: Instance,
 	destination: Folder?,
 	manifest: { RelocationManifestEntry }
 ): Folder?
@@ -700,26 +889,29 @@ local function tryRelocateModule(
 		return destination
 	end
 
-	local directRS = module:GetAttribute("RelocateToReplicatedStorage") == true
-	local directSSS = module:GetAttribute("RelocateToServerScriptService") == true
-	-- Both attributes on one module is contradictory config; no discovery route can
-	-- change that, so mark seen to avoid re-warning.
-	if directRS and directSSS then
+	local wantsReplicatedStorage = readFlag(module, "RelocateToReplicatedStorage") == true
+	local wantsServerScriptService = readFlag(module, "RelocateToServerScriptService") == true
+	-- Both attributes on one module is contradictory config; no discovery route
+	-- can change that, so mark seen to avoid re-warning.
+	if wantsReplicatedStorage and wantsServerScriptService then
 		seen[module] = true
 		newWarn(
-			`RelocateToReplicatedStorage conflicts with RelocateToServerScriptService on module '{module:GetFullName()}'; skipping relocation.`
+			"RelocateToReplicatedStorage conflicts with RelocateToServerScriptService on module",
+			`'{module:GetFullName()}'; skipping relocation.`
 		)
 		return destination
 	end
-	-- RelocateToServerScriptService opts out of any ancestor folder's cascade; the move
-	-- itself happens post-require in loadModule.attemptRelocate. Stamp ServerOnly now so a
-	-- concurrently loading client cannot require the module before it is hidden. Explicit
-	-- user values win over the stamp.
-	if directSSS then
+	-- RelocateToServerScriptService opts out of any ancestor folder's cascade;
+	-- the move itself happens after the require, in
+	-- relocateToServerScriptService. Stamp ServerOnly now so a client loading
+	-- at the same time cannot require the module before it is hidden. Values
+	-- the user set win over the stamp.
+	if wantsServerScriptService then
 		seen[module] = true
-		if module:GetAttribute("ClientOnly") == true then
+		if readFlag(module, "ClientOnly") == true then
 			newWarn(
-				`ClientOnly conflicts with RelocateToServerScriptService on module '{module:GetFullName()}'; not stamping ServerOnly.`
+				"ClientOnly conflicts with RelocateToServerScriptService on module",
+				`'{module:GetFullName()}'; not stamping ServerOnly.`
 			)
 		elseif module:GetAttribute("ServerOnly") == nil then
 			module:SetAttribute("ServerOnly", true)
@@ -729,21 +921,24 @@ local function tryRelocateModule(
 	if not isMarkedForReplicatedRelocation(module, container) then
 		return destination
 	end
-	-- A module already inside the destination moved there with a parent module relocated
-	-- earlier in this pass; relocating it again would tear that subtree apart.
-	if REPLICATED_RELOCATED_MODULES and module:IsDescendantOf(REPLICATED_RELOCATED_MODULES) then
+	-- A module already inside the destination moved there with a parent module
+	-- relocated earlier in this pass; relocating it again would tear that
+	-- subtree apart.
+	if replicatedRelocatedFolder and module:IsDescendantOf(replicatedRelocatedFolder) then
 		seen[module] = true
 		return destination
 	end
 	if module:IsDescendantOf(ReplicatedStorage) then
 		seen[module] = true
 		newWarn(
-			`RelocateToReplicatedStorage is enabled on module '{module:GetFullName()}' that's already in ReplicatedStorage; skipping.`
+			`RelocateToReplicatedStorage is enabled on module '{module:GetFullName()}'`,
+			"that's already in ReplicatedStorage; skipping."
 		)
 		return destination
 	end
 
-	-- Collect ancestor folders between container (exclusive) and module's parent (inclusive)
+	-- Ancestor folders between the container (exclusive) and the module's
+	-- parent (inclusive).
 	local ancestors: { Instance } = {}
 	local cursor: Instance? = module.Parent
 	while cursor and cursor ~= container do
@@ -751,44 +946,41 @@ local function tryRelocateModule(
 		cursor = cursor.Parent
 	end
 	if cursor ~= container then
-		-- Container-dependent failure: left unseen so a later route with a valid
-		-- container can still relocate the module.
+		-- Container-dependent failure: left unseen so a later route with a
+		-- valid container can still relocate the module.
 		newWarn(
-			`Module '{module:GetFullName()}' is not a descendant of any provided container; skipping RelocateToReplicatedStorage.`
+			`Module '{module:GetFullName()}' is not a descendant of any provided container;`,
+			"skipping RelocateToReplicatedStorage."
 		)
 		return destination
 	end
 	seen[module] = true
 
-	if not destination then
-		destination = ensureReplicatedRelocatedFolder()
-	end
+	local relocationRoot = destination or ensureReplicatedRelocatedFolder()
 	local originalParent = module.Parent
 	local relocatedPath = getDottedPathToContainer(module, container)
-	-- The manifest is the authoritative copy of this path; the attribute stays for debugging.
-	local originalSSSPath = getDottedPathFromService(module, ServerScriptService)
-	if originalSSSPath then
-		module:SetAttribute("_OriginalSSSPath", originalSSSPath)
+	-- The manifest is the authoritative copy of this path; the attribute stays
+	-- for debugging.
+	local originalServerPath = getDottedPathFromService(module, ServerScriptService)
+	if originalServerPath then
+		module:SetAttribute("_OriginalSSSPath", originalServerPath)
 	end
-	local mirroredParent = getOrCreateMirroredParent(destination :: Folder, ancestors)
+	local mirroredParent = getOrCreateMirroredParent(relocationRoot, ancestors)
 
 	if mirroredParent:FindFirstChild(module.Name) then
-		-- Pointer paths resolve by name, so one of the colliding modules' pointers will
-		-- return the wrong instance.
+		-- Pointer paths resolve by name, so one of the colliding modules'
+		-- pointers will return the wrong instance.
 		newWarn(
-			`Relocated module '{module:GetFullName()}' collides with an existing same-named child of mirror folder '{mirroredParent:GetFullName()}'; require paths may resolve to the wrong module. Rename one of the colliding instances.`
+			`Relocated module '{module:GetFullName()}' collides with an existing same-named child`,
+			`of mirror folder '{mirroredParent:GetFullName()}'; require paths may resolve to the`,
+			"wrong module. Rename one of the colliding instances."
 		)
 	end
 
-	local pointer = relocatedTemplate:Clone()
-	pointer.Name = module.Name
-	pointer:SetAttribute("_RelocatedService", "ReplicatedStorage")
-	pointer:SetAttribute("_RelocatedPath", relocatedPath)
-	-- Without these, the load pass would treat the pointer differently than the real module
-	-- (e.g. the server would load a ClientOnly module through its unfiltered pointer).
+	local pointer = createPointer(template, module.Name, "ReplicatedStorage", relocatedPath)
 	local mirroredAttributes: { [string]: any } = {}
-	for _, attributeName in ipairs({ "ClientOnly", "ServerOnly", "IgnoreLoader", "LoaderPriority", "Parallel" }) do
-		local value = module:GetAttribute(attributeName)
+	for _, attributeName in POINTER_ATTRIBUTES do
+		local value = readPointerAttribute(module, attributeName)
 		if value ~= nil then
 			pointer:SetAttribute(attributeName, value)
 			mirroredAttributes[attributeName] = value
@@ -800,509 +992,538 @@ local function tryRelocateModule(
 	local descendantCount = #module:GetDescendants()
 	table.insert(manifest, {
 		RelocatedPath = relocatedPath,
-		ServerScriptServicePath = originalSSSPath,
+		ServerScriptServicePath = originalServerPath,
 		Attributes = if next(mirroredAttributes) ~= nil then mirroredAttributes else nil,
 		DescendantCount = if descendantCount > 0 then descendantCount else nil,
 	})
-	return destination
+	return relocationRoot
 end
 
 --[[
-	Server-only pre-pass: discovers modules the same way getModules does (each passed container,
-	plus CollectionService-tagged ModuleScripts and Folders when UseCollectionService is enabled)
-	and relocates the ones marked with RelocateToReplicatedStorage (directly or via folder cascade)
-	to a mirrored hierarchy under ReplicatedStorage.RELOCATED_MODULES, leaving a hierarchy-aware
-	pointer behind so relative requires from neighboring server modules still resolve.
-	Returns the manifest of everything it relocated, which start() publishes to clients.
+	Server-only pre-pass: discovers modules the same way getModules does (each
+	passed container, plus CollectionService-tagged ModuleScripts and Folders
+	when UseCollectionService is enabled) and relocates the ones marked with
+	RelocateToReplicatedStorage (directly or via folder cascade) to a mirrored
+	hierarchy under ReplicatedStorage.RELOCATED_MODULES, leaving a
+	hierarchy-aware pointer behind so relative requires from neighboring server
+	modules still resolve. Returns the manifest of everything it relocated,
+	which Start publishes to clients.
 ]]
-local function relocateToReplicatedStoragePass(containers: { Instance }): { RelocationManifestEntry }
+local function relocateToReplicatedStoragePass(
+	containers: { Instance }
+): { RelocationManifestEntry }
 	local manifest: { RelocationManifestEntry } = {}
-	if not RunService:IsServer() then
+	if not isServer then
 		return manifest
 	end
 
-	local relocatedTemplate = script:FindFirstChild("RelocatedTemplate")
-	assert(relocatedTemplate, "ModuleLoader missing RelocatedTemplate child")
-
+	local template = getRelocatedTemplate()
 	local destination: Folder? = nil
 	local seen: { [ModuleScript]: true } = {}
 
-	for _, container in ipairs(containers) do
-		-- A tagged Folder passed as a container anchors at its parent, same as tag discovery
-		-- below, so the folder and its LoaderTag land in the mirror where clients can find them.
+	for _, container in containers do
+		-- A tagged Folder passed as a container anchors at its parent, same as
+		-- tag discovery below, so the folder and its LoaderTag land in the
+		-- mirror where clients can find them.
 		local anchor: Instance = container
 		if
-			SETTINGS.USE_COLLECTION_SERVICE
-			and TAG ~= ""
+			settings.USE_COLLECTION_SERVICE
+			and loaderTag ~= ""
 			and container:IsA("Folder")
 			and container.Parent
-			and CollectionService:HasTag(container, TAG)
+			and CollectionService:HasTag(container, loaderTag)
 		then
 			anchor = container.Parent :: Instance
 		end
-		for _, module in ipairs(findAllFromClass("ModuleScript", container) :: { ModuleScript }) do
-			destination = tryRelocateModule(module, anchor, seen, relocatedTemplate, destination, manifest)
+		for _, module in findAllFromClass("ModuleScript", container) do
+			destination = tryRelocateModule(module, anchor, seen, template, destination, manifest)
 		end
 	end
 
-	-- Mirror getModules' tag discovery so tag-only setups relocate too. GetTagged order is
-	-- unspecified and varies per session, so anchoring must not depend on it: folders are
-	-- processed first (outermost first), directly tagged modules last. A module covered by both
-	-- routes then always keeps its folder chain in the mirror instead of rolling the dice on
-	-- mirror depth every session.
-	if SETTINGS.USE_COLLECTION_SERVICE and TAG ~= "" then
-		local taggedFolders: { Folder } = {}
-		local taggedModules: { ModuleScript } = {}
-		for _, tagged in CollectionService:GetTagged(TAG) do
-			if tagged:IsA("Folder") and tagged.Parent then
-				table.insert(taggedFolders, tagged)
-			elseif tagged:IsA("ModuleScript") and tagged.Parent then
-				table.insert(taggedModules, tagged)
-			end
-		end
-		table.sort(taggedFolders, function(a, b)
-			return getDepthInHierarchy(a, game) < getDepthInHierarchy(b, game)
-		end)
-
-		for _, folder in ipairs(taggedFolders) do
-			for _, descendant in folder:GetDescendants() do
-				if descendant:IsA("ModuleScript") then
-					destination = tryRelocateModule(descendant :: ModuleScript, folder.Parent :: Instance, seen, relocatedTemplate, destination, manifest)
-				end
-			end
-		end
-		for _, module in ipairs(taggedModules) do
-			destination = tryRelocateModule(module, module.Parent :: Instance, seen, relocatedTemplate, destination, manifest)
+	if not settings.USE_COLLECTION_SERVICE or loaderTag == "" then
+		return manifest
+	end
+	-- Mirror getModules' tag discovery so tag-only setups relocate too.
+	-- GetTagged order is unspecified and varies per session, so anchoring must
+	-- not depend on it: folders are processed first (outermost first),
+	-- directly tagged modules last. A module covered by both routes then
+	-- always keeps its folder chain in the mirror instead of rolling the dice
+	-- on mirror depth every session.
+	local taggedFolders: { Folder } = {}
+	local taggedModules: { ModuleScript } = {}
+	for _, tagged in CollectionService:GetTagged(loaderTag) do
+		if tagged:IsA("Folder") and tagged.Parent then
+			table.insert(taggedFolders, tagged)
+		elseif tagged:IsA("ModuleScript") and tagged.Parent then
+			table.insert(taggedModules, tagged)
 		end
 	end
+	table.sort(taggedFolders, function(a, b)
+		return getDepthInHierarchy(a, game) < getDepthInHierarchy(b, game)
+	end)
 
+	for _, folder in taggedFolders do
+		local anchor = folder.Parent :: Instance
+		for _, descendant in folder:GetDescendants() do
+			if not descendant:IsA("ModuleScript") then
+				continue
+			end
+			local module = descendant :: ModuleScript
+			destination = tryRelocateModule(module, anchor, seen, template, destination, manifest)
+		end
+	end
+	for _, module in taggedModules do
+		local anchor = module.Parent :: Instance
+		destination = tryRelocateModule(module, anchor, seen, template, destination, manifest)
+	end
 	return manifest
 end
 
-local function loadModule(module: ModuleScript)
-	-- attempts to relocate the module, if eligible
-	local function attemptRelocate(module: ModuleScript)
-		if RunService:IsClient() then
+--[[
+	Moves a RelocateToServerScriptService module into
+	ServerScriptService.RELOCATED_MODULES and leaves a server-only pointer in
+	its place. Runs after the module's require, so relative requires inside it
+	resolve from its original spot.
+]]
+local function relocateToServerScriptService(module: ModuleScript)
+	if isClient then
+		return
+	end
+	if not readFlag(module, "RelocateToServerScriptService") then
+		return
+	end
+	if module:IsDescendantOf(ServerScriptService) then
+		-- Already moved by this loader (found through overlapping routes).
+		if serverRelocatedFolder and module.Parent == serverRelocatedFolder then
 			return
 		end
-		if not module:GetAttribute("RelocateToServerScriptService") then
-			return
-		end
-		if module:IsDescendantOf(ServerScriptService) then
-			-- Already relocated by this loader (double discovery through overlapping routes).
-			if module.Parent == RELOCATED_MODULES then
-				return
-			end
-			-- A module under a RelocateToReplicatedStorage folder uses RelocateToServerScriptService
-			-- as a cascade opt-out: it is meant to stay on the server, so being already in
-			-- ServerScriptService is correct, not a mistake. Only warn about a genuinely redundant
-			-- attribute (no relocating ancestor folder to opt out of).
-			if not isOptingOutOfReplicatedRelocation(module) then
-				warn(
-					`RelocateToServerScriptService attribute is enabled on module '{module:GetFullName()}' that's already in ServerScriptService`
-				)
-			end
-			return
-		end
-		local relocatedTemplate = script:FindFirstChild("RelocatedTemplate")
-		assert(relocatedTemplate, "ModuleLoader missing RelocatedTemplate child")
-		if RELOCATED_MODULES:FindFirstChild(module.Name) then
-			-- The destination is flat and pointers resolve by name, so one of the colliding
-			-- modules' pointers will return the wrong module.
+		-- Under a RelocateToReplicatedStorage folder the attribute is a cascade
+		-- opt-out, so already being in ServerScriptService is correct. Only an
+		-- attribute with no relocating folder above it is redundant.
+		if not isOptingOutOfReplicatedRelocation(module) then
 			newWarn(
-				`Relocating module '{module.Name}' into ServerScriptService.RELOCATED_MODULES beside an existing same-named child; pointers may resolve to the wrong module. Rename one of the colliding modules.`
+				"RelocateToServerScriptService attribute is enabled on module",
+				`'{module:GetFullName()}' that's already in ServerScriptService`
 			)
 		end
-		local clone = relocatedTemplate:Clone()
-		clone.Name = module.Name
-		clone:SetAttribute("ServerOnly", true)
-		clone:SetAttribute("_RelocatedService", "ServerScriptService")
-		clone:SetAttribute("_RelocatedPath", module.Name)
-		clone.Parent = module.Parent
-		module.Parent = RELOCATED_MODULES
+		return
 	end
 
-	if module:GetAttribute("Parallel") then
-		local actorTemplate = if isClient then actorForClient else actorForServer
-
-		if actorTemplate == nil then
-			newWarn(`Parallel module {module.Name} requested but no Actor template is configured - loading normally`)
-		else
-			-- A pointer and its real target can both be discovered, and Actor VMs cannot share a
-			-- require() cache, so dedup on the canonical instance or the module runs twice.
-			local canonical = resolveRelocationTarget(module)
-			if seenParallelTargets[canonical] then
-				if SETTINGS.VERBOSE_LOADING then
-					newPrint(`Skipping PARALLEL module '{module.Name}' - already loaded via its relocated counterpart`)
-				end
-				tracker.Load[module] = true
-				tracker.Init[module] = true
-				tracker.Start[module] = true
-				return
-			end
-			seenParallelTargets[canonical] = true
-
-			-- This module needs to be run in parallel, so create new actor and script.
-			local newActorSystem = actorTemplate:Clone()
-			local loaderClone = parallelModuleLoader:Clone()
-			loaderClone.Parent = newActorSystem
-			local actorScript: BaseScript = newActorSystem:FindFirstChildWhichIsA("BaseScript") :: any
-
-			actorScript.Enabled = true
-			actorScript.Name = `Required{module.Name}`
-			newActorSystem.Parent = ACTOR_PARENT
-
-			if not actorScript:GetAttribute("Loaded") then
-				actorScript:GetAttributeChangedSignal("Loaded"):Wait()
-			end
-
-			newActorSystem:SendMessage("RequireModule", module)
-
-			if SETTINGS.VERBOSE_LOADING then
-				newPrint(("Loading PARALLEL module '%s'"):format(module.Name))
-			end
-
-			local startTime = tick()
-			if not actorScript:GetAttribute("Required") then
-				-- Yielding here is the inherent actor handoff, not a module-level yield --
-				-- no security implication. Just wait for the actor to finish requiring.
-				actorScript:GetAttributeChangedSignal("Required"):Wait()
-			end
-			local endTime = tick()
-
-			if SETTINGS.VERBOSE_LOADING and not actorScript:GetAttribute("Errored") then
-				newPrint(`>> Loaded PARALLEL module {module.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
-			elseif actorScript:GetAttribute("Errored") then
-				newWarn(
-					`>> Failed to load PARALLEL module {module.Name}`,
-					("(took %.3f seconds)"):format(endTime - startTime)
-				)
-			end
-
-			-- relocate after loading to maintain relative paths within modules
-			attemptRelocate(module)
-
-			trackerForActors.Load[module] = newActorSystem
-			tracker.Load[module] = true
-			tracker.Init[module] = true
-			tracker.Start[module] = true
-			return
-		end
+	local template = getRelocatedTemplate()
+	local destination = ensureServerRelocatedFolder()
+	if destination:FindFirstChild(module.Name) then
+		-- The destination is flat and pointers resolve by name, so one of the
+		-- colliding modules' pointers will return the wrong module.
+		newWarn(
+			`Relocating module '{module.Name}' into ServerScriptService.RELOCATED_MODULES`,
+			"beside an existing same-named child; pointers may resolve to the wrong module.",
+			"Rename one of the colliding modules."
+		)
 	end
+	local pointer = createPointer(template, module.Name, "ServerScriptService", module.Name)
+	pointer:SetAttribute("ServerOnly", true)
+	pointer.Parent = module.Parent
+	module.Parent = destination
+end
 
-	if SETTINGS.VERBOSE_LOADING then
-		newPrint(("Loading module '%s'"):format(module.Name))
-	end
-	local mainThread = coroutine.running()
-	local startTime = tick()
-	local endTime
-	local executionSuccess, errMsg = false, ""
-	local thread: thread = task.spawn(function()
-		debug.setmemorycategory(`Module::{module.Name}`)
-		local success, result = xpcall(function()
-			return require(module)
+--[[
+	Runs one load, Init, or Start call in its own thread and waits for it to
+	finish, warning while it runs past the yield threshold. Returns whether it
+	succeeded, its error with a traceback, and the seconds it took.
+]]
+local function runLifecycleStepAsync(step: LifecycleStep): (boolean, string, number)
+	local callerThread = coroutine.running()
+	local startTime = os.clock()
+	local succeeded = false
+	local failure = ""
+	local isFinished = false
+
+	task.spawn(function()
+		debug.setmemorycategory(step.MemoryCategory)
+		local ok, result = xpcall(function()
+			step.Run()
 		end, debug.traceback)
 		debug.resetmemorycategory()
-		if success then
-			-- Duplicate loaded values (a pointer and its real target both discovered) register
-			-- once so Init/Start run once per result. Only tables dedup: primitives would collide
-			-- across unrelated modules, and indexing .Init on them would error outside the xpcall.
-			local isTable = type(result) == "table"
-			local isDuplicate = isTable and seenResults[result] ~= nil
-			if not isDuplicate then
-				if isTable then
-					seenResults[result] = true
-					if result.Init then
-						tracker.Init[module] = false
-					end
-					if result.Start then
-						tracker.Start[module] = false
-					end
-				end
-				tracker.Load[module] = result
-			end
-			executionSuccess = true
-			-- Relocation runs after require to keep relative paths valid, and also for
-			-- duplicates so an SSS-marked module is hidden no matter which copy loaded first.
-			attemptRelocate(module)
-		else
-			errMsg = result
+		succeeded = ok
+		if not ok then
+			failure = tostring(result)
 		end
-		endTime = tick()
-		if coroutine.status(mainThread) == "suspended" then
-			task.spawn(mainThread)
+		isFinished = true
+		if coroutine.status(callerThread) == "suspended" then
+			task.spawn(callerThread)
 		end
 	end)
-	if not endTime then
-		endTime = tick()
-	end
-	if coroutine.status(thread) == "suspended" then
-		-- Only flag yielding modules that are scheduled for SSS-direction relocation,
-		-- because that's the only flow where yielding widens a real race window
-		-- (relocation happens AFTER require). RelocateToReplicatedStorage uses a
-		-- pre-pass and isn't affected by post-require yielding.
-		if RunService:IsServer() and module:GetAttribute("RelocateToServerScriptService") then
-			newWarn(
-				`[SECURITY] Module '{module.Name}' yielded during require()!\n`,
-				`Modules with RelocateToServerScriptService may still be accessible to clients.\n`,
-				`Avoid yielding in module top-level code to ensure timely relocation.`
-			)
-		end
 
-		local loopThread = task.spawn(function()
-			task.wait(SETTINGS.YIELD_THRESHOLD)
+	if not isFinished then
+		if step.OnYield then
+			step.OnYield()
+		end
+		local threshold = settings.YIELD_THRESHOLD or DEFAULT_YIELD_THRESHOLD
+		local warningThread = task.delay(threshold, function()
 			while true do
-				if coroutine.status(thread) == "suspended" then
-					newWarn(
-						`>> Loading Module '{module.Name}' is taking a while!`,
-						("(%.3f seconds elapsed)"):format(tick() - startTime)
-					)
-				end
-				task.wait(5)
+				newWarn(
+					`>> {step.Description} is taking a while!`,
+					`({formatSeconds(os.clock() - startTime)} seconds elapsed)`
+				)
+				task.wait(SLOW_CALL_WARNING_INTERVAL)
 			end
 		end)
-		coroutine.yield()
-		if coroutine.status(loopThread) ~= "dead" then
-			task.cancel(loopThread)
+		while not isFinished do
+			coroutine.yield()
 		end
+		task.cancel(warningThread)
 	end
 
-	if SETTINGS.VERBOSE_LOADING and executionSuccess then
-		newPrint(`>> Loaded module {module.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
-	elseif not executionSuccess then
+	return succeeded, failure, os.clock() - startTime
+end
+
+local function getActorParentAsync(): Instance
+	if isClient then
+		return (Players.LocalPlayer :: Player):WaitForChild("PlayerScripts")
+	end
+	return ServerScriptService
+end
+
+--[[
+	Requires a Parallel module inside a fresh Actor. Actor VMs keep their own
+	require cache, so when a pointer and its real module are both discovered,
+	they are deduplicated by the instance they resolve to, not by the value
+	they return.
+]]
+local function loadParallelModuleAsync(module: ModuleScript, actorTemplate: Actor)
+	local canonicalModule = resolveRelocationTarget(module)
+	if seenParallelTargets[canonicalModule] then
+		if settings.VERBOSE_LOADING then
+			newPrint(
+				`Skipping PARALLEL module '{module.Name}' - already loaded`,
+				"via its relocated counterpart"
+			)
+		end
+		return
+	end
+	seenParallelTargets[canonicalModule] = true
+
+	local actor = actorTemplate:Clone()
+	local loaderCopy = parallelModuleLoader:Clone()
+	loaderCopy.Parent = actor
+	local actorScript: BaseScript = actor:FindFirstChildWhichIsA("BaseScript") :: any
+	actorScript.Enabled = true
+	actorScript.Name = `Required{module.Name}`
+	actor.Parent = getActorParentAsync()
+
+	if settings.VERBOSE_LOADING then
+		newPrint(`Loading PARALLEL module '{module.Name}'`)
+	end
+	local _, _, elapsed = runLifecycleStepAsync({
+		Description = `Loading PARALLEL Module '{module.Name}'`,
+		MemoryCategory = `Module::{module.Name}`,
+		Run = function()
+			waitForAttributeAsync(actorScript, "Loaded")
+			actor:SendMessage("RequireModule", module)
+			waitForAttributeAsync(actorScript, "Required")
+		end,
+	})
+	local didRequireFail = actorScript:GetAttribute("Errored") == true
+	if didRequireFail then
+		newWarn(
+			`>> Failed to load PARALLEL module {module.Name}`,
+			`(took {formatSeconds(elapsed)} seconds)`
+		)
+	elseif settings.VERBOSE_LOADING then
+		newPrint(
+			`>> Loaded PARALLEL module {module.Name}`,
+			`(took {formatSeconds(elapsed)} seconds)`
+		)
+	end
+
+	-- Relocating after the require keeps relative paths inside the module
+	-- valid.
+	relocateToServerScriptService(module)
+
+	if didRequireFail then
+		return
+	end
+	actorsByModule[module] = actor
+	tracker.Load[module] = true
+end
+
+local function loadModule(module: ModuleScript)
+	if readFlag(module, "Parallel") then
+		local actorTemplate = if isClient then actorForClient else actorForServer
+		if actorTemplate then
+			loadParallelModuleAsync(module, actorTemplate)
+			return
+		end
+		newWarn(
+			`Parallel module {module.Name} requested but no Actor template is configured -`,
+			"loading normally"
+		)
+	end
+
+	if settings.VERBOSE_LOADING then
+		newPrint(`Loading module '{module.Name}'`)
+	end
+	local result: any = nil
+	local succeeded, failure, elapsed = runLifecycleStepAsync({
+		Description = `Loading Module '{module.Name}'`,
+		MemoryCategory = `Module::{module.Name}`,
+		Run = function()
+			result = require(module)
+		end,
+		OnYield = function()
+			-- Only a module moved after its require stays visible to clients
+			-- while the require yields.
+			if isServer and readFlag(module, "RelocateToServerScriptService") then
+				newWarn(
+					`[SECURITY] Module '{module.Name}' yielded during require()!\n`,
+					"Modules with RelocateToServerScriptService may still be accessible to"
+						.. " clients.\n",
+					"Avoid yielding in module top-level code to ensure timely relocation."
+				)
+			end
+		end,
+	})
+	if not succeeded then
 		newWarn(
 			`>> Failed to load module {module.Name}`,
-			("(took %.3f seconds)\n%s"):format(endTime - startTime, errMsg)
+			`(took {formatSeconds(elapsed)} seconds)\n{failure}`
+		)
+		return
+	end
+
+	-- Duplicate loaded values (a pointer and its real target both discovered)
+	-- register once so Init/Start run once per result. Only tables dedup,
+	-- since primitives would collide across unrelated modules.
+	local isTable = type(result) == "table"
+	local isDuplicate = isTable and seenResults[result] ~= nil
+	if not isDuplicate then
+		if isTable then
+			seenResults[result] = true
+		end
+		tracker.Load[module] = result
+	end
+	-- Relocation runs after the require to keep relative paths valid, and for
+	-- duplicates too, so a module is hidden no matter which copy loaded first.
+	relocateToServerScriptService(module)
+
+	if settings.VERBOSE_LOADING then
+		newPrint(`>> Loaded module {module.Name}`, `(took {formatSeconds(elapsed)} seconds)`)
+	end
+end
+
+--[[
+	Records every Init/Start function a loaded table defines itself. Runs once
+	after the load phase, so which module owns a shared function never depends
+	on load order.
+]]
+local function recordOwnedLifecycleMethods()
+	for result in seenResults do
+		for _, methodName in LIFECYCLE_METHODS do
+			local method = rawget(result, methodName)
+			if method ~= nil then
+				ownedLifecycleMethods[method] = true
+			end
+		end
+	end
+end
+
+--[[
+	Returns the Init/Start method to call on a loaded module, or nil. A method
+	the module only inherits through its metatable (e.g. a Client service
+	inheriting its Shared service's Init) is skipped when another loaded
+	module defines it, so that module runs it once with itself as self instead
+	of once more per inheritor.
+]]
+local function getLifecycleMethod(loadedModule: any, methodName: string): ((any) -> ())?
+	-- Non-table results (function or constant modules) are valid loads with no
+	-- lifecycle.
+	if type(loadedModule) ~= "table" then
+		return nil
+	end
+	local method = loadedModule[methodName]
+	if not method then
+		return nil
+	end
+	if rawget(loadedModule, methodName) == nil and ownedLifecycleMethods[method] then
+		return nil
+	end
+	return method
+end
+
+local function getLifecycleResults(methodName: LifecycleMethodName): { [ModuleScript]: boolean }
+	return if methodName == "Init" then tracker.Init else tracker.Start
+end
+
+local function runParallelLifecycleMethodAsync(
+	actor: Actor,
+	module: ModuleScript,
+	methodName: LifecycleMethodName
+)
+	local words = LIFECYCLE_LOG_WORDS[methodName]
+	local results = getLifecycleResults(methodName)
+	local doneAttribute = if methodName == "Init" then "Initialized" else "Started"
+	local actorScript: BaseScript = actor:FindFirstChildWhichIsA("BaseScript") :: any
+	results[module] = false
+
+	if settings.VERBOSE_LOADING then
+		newPrint(`{words.Running} PARALLEL module '{module.Name}'`)
+	end
+	local _, _, elapsed = runLifecycleStepAsync({
+		Description = `:{methodName}() for PARALLEL Module '{module.Name}'`,
+		MemoryCategory = `Module::{module.Name}::{methodName}`,
+		Run = function()
+			actor:SendMessage(`{methodName}Module`)
+			waitForAttributeAsync(actorScript, doneAttribute)
+		end,
+	})
+	if actorScript:GetAttribute("Errored") then
+		newWarn(
+			`>> Failed to {words.Verb} PARALLEL module {module.Name}`,
+			`(took {formatSeconds(elapsed)} seconds)`
+		)
+		return
+	end
+
+	results[module] = true
+	if settings.VERBOSE_LOADING then
+		newPrint(
+			`>> {words.Finished} PARALLEL module {module.Name}`,
+			`(took {formatSeconds(elapsed)} seconds)`
 		)
 	end
 end
 
-local function initializeModule(loadedModule, module: ModuleScript)
-	if trackerForActors.Load[module] then
-		local actorScript: BaseScript = trackerForActors.Load[module]:FindFirstChildWhichIsA("BaseScript") :: any
-		trackerForActors.Load[module]:SendMessage("InitModule")
-
-		if SETTINGS.VERBOSE_LOADING then
-			newPrint(("Initializing PARALLEL module '%s'"):format(actorScript.Name))
-		end
-
-		local startTime = os.clock()
-		if not actorScript:GetAttribute("Initialized") then
-			actorScript:GetAttributeChangedSignal("Initialized"):Wait()
-		end
-		local endTime = os.clock()
-
-		if SETTINGS.VERBOSE_LOADING and not actorScript:GetAttribute("Errored") then
-			newPrint(`>> Initialized PARALLEL module {actorScript.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
-		elseif actorScript:GetAttribute("Errored") then
-			newWarn(`>> Failed to init PARALLEL module {actorScript.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
-		end
+--[[
+	Runs a loaded module's Init or Start, recording the outcome in the tracker:
+	false while it runs or after it fails, true once it succeeds.
+]]
+local function runLifecycleMethodAsync(
+	loadedModule: any,
+	module: ModuleScript,
+	methodName: LifecycleMethodName
+)
+	local actor = actorsByModule[module]
+	if actor then
+		runParallelLifecycleMethodAsync(actor, module, methodName)
 		return
 	end
 
-	-- Non-table results (function/constant modules) are valid loads with no lifecycle.
-	if type(loadedModule) ~= "table" or not loadedModule.Init then
+	local method = getLifecycleMethod(loadedModule, methodName)
+	if not method then
+		return
+	end
+	local words = LIFECYCLE_LOG_WORDS[methodName]
+	local results = getLifecycleResults(methodName)
+	results[module] = false
+
+	if settings.VERBOSE_LOADING then
+		newPrint(`{words.Running} module '{module.Name}'`)
+	end
+	local succeeded, failure, elapsed = runLifecycleStepAsync({
+		Description = `:{methodName}() for Module '{module.Name}'`,
+		MemoryCategory = `Module::{module.Name}::{methodName}`,
+		Run = function()
+			method(loadedModule)
+		end,
+	})
+	if not succeeded then
+		newWarn(
+			`>> Failed to {words.Verb} module {module.Name}`,
+			`(took {formatSeconds(elapsed)} seconds)\n{failure}`
+		)
 		return
 	end
 
-	if SETTINGS.VERBOSE_LOADING then
-		newPrint(("Initializing module '%s'"):format(module.Name))
-	end
-	local mainThread = coroutine.running()
-	local startTime = os.clock()
-	local endTime
-	local executionSuccess, errMsg = false, ""
-	local thread: thread = task.spawn(function()
-		debug.setmemorycategory(`Module::{module.Name}::Init`)
-		local success, err = xpcall(function()
-			loadedModule:Init()
-		end, debug.traceback)
-		debug.resetmemorycategory()
-		executionSuccess = success
-		if success then
-			tracker.Init[module] = true
-		else
-			errMsg = err
-		end
-		endTime = os.clock()
-		if coroutine.status(mainThread) == "suspended" then
-			task.spawn(mainThread)
-		end
-	end)
-	if not endTime then
-		endTime = os.clock()
-	end
-	if coroutine.status(thread) == "suspended" then
-		local loopThread = task.spawn(function()
-			task.wait(SETTINGS.YIELD_THRESHOLD)
-			while true do
-				if coroutine.status(thread) == "suspended" then
-					newWarn(`>> :Init() for Module '{module.Name}' is taking a while!`, ("(%.3f seconds elapsed)"):format(os.clock() - startTime))
-				end
-				task.wait(5)
-			end
-		end)
-		coroutine.yield()
-		if coroutine.status(loopThread) ~= "dead" then
-			task.cancel(loopThread)
-		end
-	end
-
-	if SETTINGS.VERBOSE_LOADING and executionSuccess then
-		newPrint(`>> Initialized module {module.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
-	elseif not executionSuccess then
-		newWarn(`>> Failed to init module {module.Name}`, ("(took %.3f seconds)\n%s"):format(endTime - startTime, errMsg))
-	end
-end
-
-local function startModule(loadedModule, module: ModuleScript)
-	if trackerForActors.Load[module] then
-		local actorScript: BaseScript = trackerForActors.Load[module]:FindFirstChildWhichIsA("BaseScript") :: any
-		trackerForActors.Load[module]:SendMessage("StartModule")
-
-		if SETTINGS.VERBOSE_LOADING then
-			newPrint(("Starting PARALLEL module '%s'"):format(actorScript.Name))
-		end
-
-		local startTime = os.clock()
-		if not actorScript:GetAttribute("Started") then
-			actorScript:GetAttributeChangedSignal("Started"):Wait()
-		end
-		local endTime = os.clock()
-
-		if SETTINGS.VERBOSE_LOADING and not actorScript:GetAttribute("Errored") then
-			newPrint(`>> Started PARALLEL module {actorScript.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
-		elseif actorScript:GetAttribute("Errored") then
-			newWarn(`>> Failed to start PARALLEL module {actorScript.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
-		end
-		return
-	end
-
-	-- Non-table results (function/constant modules) are valid loads with no lifecycle.
-	if type(loadedModule) ~= "table" or not loadedModule.Start then
-		return
-	end
-
-	if SETTINGS.VERBOSE_LOADING then
-		newPrint(("Starting module '%s'"):format(module.Name))
-	end
-	local mainThread = coroutine.running()
-	local startTime = os.clock()
-	local endTime
-	local executionSuccess, errMsg = false, ""
-	local thread: thread = task.spawn(function()
-		debug.setmemorycategory(`Module::{module.Name}::Start`)
-		local success, err = xpcall(function()
-			loadedModule:Start()
-		end, debug.traceback)
-		debug.resetmemorycategory()
-		executionSuccess = success
-		if success then
-			tracker.Start[module] = true
-		else
-			errMsg = err
-		end
-		endTime = os.clock()
-		if coroutine.status(mainThread) == "suspended" then
-			task.spawn(mainThread)
-		end
-	end)
-	if not endTime then
-		endTime = os.clock()
-	end
-	if coroutine.status(thread) == "suspended" then
-		local loopThread = task.spawn(function()
-			task.wait(SETTINGS.YIELD_THRESHOLD)
-			while true do
-				if coroutine.status(thread) == "suspended" then
-					newWarn(`>> :Start() for Module '{module.Name}' is taking a while!`, ("(%.3f seconds elapsed)"):format(os.clock() - startTime))
-				end
-				task.wait(5)
-			end
-		end)
-		coroutine.yield()
-		if coroutine.status(loopThread) ~= "dead" then
-			task.cancel(loopThread)
-		end
-	end
-
-	if SETTINGS.VERBOSE_LOADING and executionSuccess then
-		newPrint(`>> Started module {module.Name}`, ("(took %.3f seconds)"):format(endTime - startTime))
-	elseif not executionSuccess then
-		newWarn(`>> Failed to start module {module.Name}`, ("(took %.3f seconds)\n%s"):format(endTime - startTime, errMsg))
+	results[module] = true
+	if settings.VERBOSE_LOADING then
+		newPrint(
+			`>> {words.Finished} module {module.Name}`,
+			`(took {formatSeconds(elapsed)} seconds)`
+		)
 	end
 end
 
 --[[
-	Gets all modules to be loaded in order.
+	Gets every module to load, each listed once, in load order.
 ]]
 local function getModules(containers: { Instance }): { ModuleScript }
-	local totalModules = {}
-	for _, container in ipairs(containers) do
-		local modules = findAllFromClass("ModuleScript", container, SETTINGS.FOLDER_SEARCH_DEPTH)
-		modules = filter(modules, function(module)
-			return keepModule(container, module)
-		end)
-		totalModules = mergeArrays(totalModules, modules)
-	end
-	if SETTINGS.USE_COLLECTION_SERVICE and TAG ~= "" then
-		local function addTaggedModule(parent: Instance, module: ModuleScript)
-			if not keepModule(parent, module) then
-				return
-			end
-			if table.find(totalModules, module) then
-				return
-			end
-			table.insert(totalModules, module)
-		end
+	local shouldKeep: KeepModulePredicate = customKeepModule or keepModule
+	local modules: { ModuleScript } = {}
+	local isListed: { [ModuleScript]: true } = {}
 
-		for _, tagged in CollectionService:GetTagged(TAG) do
+	-- A module can be found through several routes (overlapping containers, a
+	-- container and a tag); it is listed by the first route that keeps it.
+	local function addModule(container: Instance, module: ModuleScript)
+		if isListed[module] then
+			return
+		end
+		if not shouldKeep(container, module) then
+			return
+		end
+		isListed[module] = true
+		table.insert(modules, module)
+	end
+
+	for _, container in containers do
+		for _, module in findAllFromClass("ModuleScript", container) do
+			addModule(container, module)
+		end
+	end
+	if settings.USE_COLLECTION_SERVICE and loaderTag ~= "" then
+		for _, tagged in CollectionService:GetTagged(loaderTag) do
 			if tagged:IsA("ModuleScript") then
 				local parent = tagged.Parent
 				if parent then
-					addTaggedModule(parent, tagged)
+					addModule(parent, tagged)
 				end
 			elseif tagged:IsA("Folder") then
 				for _, descendant in tagged:GetDescendants() do
 					if descendant:IsA("ModuleScript") then
-						addTaggedModule(tagged, descendant)
+						addModule(tagged, descendant)
 					end
 				end
 			else
-				warn(`item: {tagged} with tag: {TAG} is not a ModuleScript or Folder!`)
+				newWarn(`item: {tagged} with tag: {loaderTag} is not a ModuleScript or Folder!`)
 			end
 		end
 	end
 
-	table.sort(totalModules, function(a, b)
-		local aPriority = a:GetAttribute("LoaderPriority") or 0
-		local bPriority = b:GetAttribute("LoaderPriority") or 0
-
-		return aPriority > bPriority
+	local priorities: { [ModuleScript]: number } = {}
+	for _, module in modules do
+		priorities[module] = getLoaderPriority(module)
+	end
+	table.sort(modules, function(a, b)
+		return priorities[a] > priorities[b]
 	end)
-	return totalModules
+	return modules
 end
 
 --[[
-	Client-only: builds the local ServerScriptService pointer tree from the server-authored
-	relocation manifest so SSS require paths resolve identically on both realms. The manifest is the
-	source of truth, so no replicated instances need to exist yet: each pointer resolves with its
-	own WaitForChild walk at require time. Idempotent, safe to re-run whenever the manifest changes.
+	Client only: builds the local ServerScriptService pointer tree from the
+	server-authored relocation manifest so ServerScriptService require paths
+	resolve identically on both realms. The manifest is the source of truth,
+	so no replicated instances need to exist yet: each pointer resolves with
+	its own WaitForChild walk at require time. Safe to re-run whenever the
+	manifest changes.
 
-	Modules relocated from containers outside ServerScriptService need no rebuilt path and carry no
-	ServerScriptServicePath. Child modules that moved with a relocated parent have no manifest entry
-	at all (accessed through the parent's return table by convention).
+	Modules relocated from containers outside ServerScriptService need no
+	rebuilt path and carry no ServerScriptServicePath. Child modules that moved
+	with a relocated parent have no manifest entry at all (accessed through
+	the parent's return table by convention).
 ]]
 local function rebuildServerScriptServiceHierarchy(manifest: { any })
-	if not RunService:IsClient() or #manifest == 0 then
+	if not isClient or #manifest == 0 then
 		return
 	end
-	local relocatedTemplate = script:FindFirstChild("RelocatedTemplate")
-	assert(relocatedTemplate, "ModuleLoader missing RelocatedTemplate child")
+	local template = getRelocatedTemplate()
 
 	local builtThisPass: { [string]: true } = {}
-	for _, entry in ipairs(manifest) do
-		if typeof(entry) ~= "table" or typeof(entry.RelocatedPath) ~= "string" or entry.RelocatedPath == "" then
+	for _, entry in manifest do
+		if
+			typeof(entry) ~= "table"
+			or typeof(entry.RelocatedPath) ~= "string"
+			or entry.RelocatedPath == ""
+		then
 			continue
 		end
 		local originalPath = entry.ServerScriptServicePath
@@ -1310,10 +1531,12 @@ local function rebuildServerScriptServiceHierarchy(manifest: { any })
 			continue
 		end
 		if builtThisPass[originalPath] then
-			-- Two entries with one original path means two same-named siblings were relocated;
-			-- first entry wins, matching the server-side collision warn.
+			-- Two entries with one original path means two same-named siblings
+			-- were relocated; the first entry wins, matching the server-side
+			-- collision warning.
 			newWarn(
-				`Duplicate relocated path 'ServerScriptService.{originalPath}' in the relocation manifest; requires of this path may resolve to the wrong module.`
+				`Duplicate relocated path 'ServerScriptService.{originalPath}' in the relocation`,
+				"manifest; requires of this path may resolve to the wrong module."
 			)
 			continue
 		end
@@ -1324,10 +1547,13 @@ local function rebuildServerScriptServiceHierarchy(manifest: { any })
 		local parent = getOrCreateClientFolderPath(ServerScriptService, segments)
 		local existing = parent:FindFirstChild(leafName)
 		if existing then
-			local isOwnPointer = existing:IsA("ModuleScript") and existing:GetAttribute("_RelocatedService") ~= nil
+			local isOwnPointer = existing:IsA("ModuleScript")
+				and existing:GetAttribute("_RelocatedService") ~= nil
 			if not isOwnPointer then
 				newWarn(
-					`Cannot rebuild relocated path 'ServerScriptService.{originalPath}': '{existing:GetFullName()}' already occupies that name; requires of this path may resolve to the wrong instance.`
+					`Cannot rebuild relocated path 'ServerScriptService.{originalPath}':`,
+					`'{existing:GetFullName()}' already occupies that name; requires of this path`,
+					"may resolve to the wrong instance."
 				)
 				continue
 			end
@@ -1335,17 +1561,15 @@ local function rebuildServerScriptServiceHierarchy(manifest: { any })
 				builtThisPass[originalPath] = true
 				continue
 			end
-			-- Stale pointer from an outdated baked manifest. Re-clone instead of re-stamping
-			-- because require() caches per instance.
+			-- Stale pointer from an outdated baked manifest. Re-clone instead
+			-- of re-stamping because require() caches per instance.
 			existing:Destroy()
 		end
 
-		local pointer = relocatedTemplate:Clone()
-		pointer.Name = leafName
-		pointer:SetAttribute("_RelocatedService", "ReplicatedStorage")
-		pointer:SetAttribute("_RelocatedPath", entry.RelocatedPath)
-		-- Attribute parity with server-side pointers, so a client passing a rebuilt subtree as a
-		-- Start() container still filters ServerOnly modules.
+		local pointer = createPointer(template, leafName, "ReplicatedStorage", entry.RelocatedPath)
+		-- Attribute parity with server-side pointers, so a client passing a
+		-- rebuilt subtree as a Start() container still filters ServerOnly
+		-- modules.
 		if typeof(entry.Attributes) == "table" then
 			for name, value in entry.Attributes do
 				pointer:SetAttribute(name, value)
@@ -1357,10 +1581,10 @@ local function rebuildServerScriptServiceHierarchy(manifest: { any })
 end
 
 --[[
-	Client-only, spawned at require time (not Start) so the pointer tree exists as early as
-	possible. Listens for the whole session and re-applies manifest changes, which recovers a server
-	that calls Start() after the client's wait cap and heals stale attributes baked into the place
-	file.
+	Client only, spawned at require time (not Start) so the pointer tree
+	exists as early as possible. Listens for the whole session and re-applies
+	manifest changes, which recovers a server that calls Start() after the
+	client's wait cap and heals stale attributes baked into the place file.
 ]]
 local function clientRelocationBootstrap()
 	local lastAppliedManifest: string? = nil
@@ -1374,16 +1598,20 @@ local function clientRelocationBootstrap()
 			return true
 		end
 		lastAppliedManifest = raw
-		local ok, decoded = pcall(function()
+		local didDecode, manifest = pcall(function()
 			return HttpService:JSONDecode(raw)
 		end)
-		if not ok or typeof(decoded) ~= "table" then
-			newWarn(`Failed to decode relocation manifest; relocated ServerScriptService require paths cannot be rebuilt!\n`, decoded)
+		if not didDecode or typeof(manifest) ~= "table" then
+			newWarn(
+				"Failed to decode relocation manifest; relocated ServerScriptService require paths",
+				"cannot be rebuilt!\n",
+				manifest
+			)
 			relocationManifest = {}
 			return true
 		end
-		relocationManifest = decoded
-		rebuildServerScriptServiceHierarchy(decoded)
+		relocationManifest = manifest
+		rebuildServerScriptServiceHierarchy(manifest)
 		return true
 	end
 
@@ -1394,9 +1622,10 @@ local function clientRelocationBootstrap()
 		if not script:GetAttribute("RelocationComplete") then
 			return
 		end
-		-- The server writes the manifest before RelocationComplete and attributes replicate
-		-- atomically per instance, so a missing manifest here can only be stale baked state.
-		-- Keep waiting for the real values instead of latching a wrong result; the wait cap in
+		-- The server writes the manifest before RelocationComplete and
+		-- attributes replicate atomically per instance, so a missing manifest
+		-- here can only be stale baked state. Keep waiting for the real values
+		-- instead of latching a wrong result; the wait cap in
 		-- waitForRelocationRebuild warns if the server never arrives.
 		if not applyManifest() then
 			return
@@ -1414,15 +1643,15 @@ local function clientRelocationBootstrap()
 end
 
 --[[
-	Client-only: yields until the bootstrap has applied the manifest, capped so a missing server
-	cannot hang the client. On timeout the loader warns and proceeds; the bootstrap still rebuilds
-	in the background once the server catches up.
+	Client only: yields until the bootstrap has applied the manifest, capped
+	so a missing server cannot hang the client. On timeout the loader warns
+	and proceeds; the bootstrap still rebuilds in the background once the
+	server catches up.
 ]]
 local function waitForRelocationRebuild()
-	if not RunService:IsClient() or relocationRebuildDone then
+	if not isClient or relocationRebuildDone then
 		return
 	end
-	local WAIT_CAP = 15
 	local thread = coroutine.running()
 	local resumed = false
 	local connection: RBXScriptConnection? = nil
@@ -1440,11 +1669,14 @@ local function waitForRelocationRebuild()
 		end
 	end
 	connection = relocationRebuildSignal.Event:Connect(resume)
-	task.delay(WAIT_CAP, function()
+	task.delay(RELOCATION_MANIFEST_WAIT_CAP, function()
 		if not relocationRebuildDone then
 			newWarn(
-				`RelocationComplete was not observed within {WAIT_CAP}s; the server has not finished (or started) its relocation pre-pass.\n`,
-				`Proceeding to load; relocated require paths will be rebuilt in the background when the server catches up, but modules loading now may fail requires into ServerScriptService.`
+				`RelocationComplete was not observed within {RELOCATION_MANIFEST_WAIT_CAP}s;`,
+				"the server has not finished (or started) its relocation pre-pass.\n",
+				"Proceeding to load; relocated require paths will be rebuilt in the background",
+				"when the server catches up, but modules loading now may fail requires into",
+				"ServerScriptService."
 			)
 		end
 		resume()
@@ -1453,189 +1685,440 @@ local function waitForRelocationRebuild()
 end
 
 --[[
-	Client-only: waits (bounded) for every manifest entry to exist under RELOCATED_MODULES so the
-	discovery snapshot in getModules sees the full tree. A positive completeness check, unlike the
-	old quiet-period gate that could pass on a stalled partial tree, and free once everything has
-	replicated. Pointer resolution never depends on this, so on timeout the loader warns and
+	Walks a dotted <code>relocatedPath</code> under <code>root</code>, waiting
+	for each segment until <code>deadline</code> (an os.clock() time). Returns
+	the instance at the path, or nil and the dotted path of the first segment
+	that never arrived.
+]]
+local function waitForRelocatedPath(
+	root: Instance,
+	relocatedPath: string,
+	deadline: number
+): (Instance?, string?)
+	local current = root
+	local walked: { string } = {}
+	for segment in string.gmatch(relocatedPath, "[^%.]+") do
+		table.insert(walked, segment)
+		local budget = deadline - os.clock()
+		local child = if budget > 0
+			then current:WaitForChild(segment, budget)
+			else current:FindFirstChild(segment)
+		if not child then
+			return nil, table.concat(walked, ".")
+		end
+		current = child
+	end
+	return current, nil
+end
+
+--[[
+	Server only: records every path a client may ask to have resent, from the
+	manifest the relocation pre-pass produced, and whether each subtree is
+	small enough to resend. Done once here so a request never makes the server
+	walk a subtree.
+]]
+local function recordResendablePaths(manifest: { RelocationManifestEntry })
+	local root = replicatedRelocatedFolder
+	if not root then
+		return
+	end
+	for _, entry in manifest do
+		local prefix: string? = nil
+		local instance: Instance? = root
+		for segment in string.gmatch(entry.RelocatedPath, "[^%.]+") do
+			prefix = if prefix then `{prefix}.{segment}` else segment
+			instance = if instance then instance:FindFirstChild(segment) else nil
+			local path = prefix :: string
+			if instance and resendablePaths[path] == nil then
+				local descendantCount = #instance:GetDescendants()
+				resendablePaths[path] = descendantCount <= RELOCATION_REPAIR_MAX_DESCENDANTS
+			end
+		end
+	end
+end
+
+--[[
+	Server only: detaches a relocated instance and re-attaches it, which makes
+	every client that lacks it receive it again. Clients that already have it
+	keep the same instance; they only see its ancestry change twice.
+]]
+local function resendRelocatedInstanceAsync(player: Player, path: string)
+	local root = replicatedRelocatedFolder
+	if not root then
+		return
+	end
+	local instance: Instance? = root
+	for segment in string.gmatch(path, "[^%.]+") do
+		instance = (instance :: Instance):FindFirstChild(segment)
+		if not instance then
+			return
+		end
+	end
+	local target = instance :: Instance
+	local parent = target.Parent
+	if target == root or not parent then
+		return
+	end
+	local lastResend = lastResendTimes[target]
+	if lastResend and os.clock() - lastResend < RELOCATION_REPAIR_COOLDOWN then
+		if settings.VERBOSE_LOADING then
+			newPrint(
+				`Skipping resend of relocated '{path}' for {player.Name}:`,
+				"it was resent moments ago."
+			)
+		end
+		return
+	end
+	-- Counted across all players, so rejoining cannot keep the relocated tree
+	-- churning.
+	local now = os.clock()
+	while recentResendTimes[1] and now - recentResendTimes[1] > RELOCATION_REPAIR_RATE_WINDOW do
+		table.remove(recentResendTimes, 1)
+	end
+	if #recentResendTimes >= RELOCATION_REPAIR_MAX_RESENDS_PER_WINDOW then
+		newWarn(`Not resending relocated '{path}' for {player.Name}: too many resends recently.`)
+		return
+	end
+	table.insert(recentResendTimes, now)
+	lastResendTimes[target] = now
+
+	newWarn(`Resending relocated '{path}' because it never reached {player.Name}.`)
+	target.Parent = nil
+	task.wait(RELOCATION_REPAIR_DETACH_TIME)
+	target.Parent = parent
+end
+
+--[[
+	Server only: works through queued resends one at a time, once the server
+	has finished loading. A resend detaches a subtree for every realm, so none
+	may land in the middle of the server's own load, and one at a time means a
+	folder's resend never overlaps a resend of something inside it.
+]]
+local function processPendingResendsAsync()
+	waitForAttributeAsync(script, "ServerLoaded")
+	while #pendingResends > 0 do
+		local resend = table.remove(pendingResends, 1) :: PendingResend
+		local resent, failure = pcall(function()
+			resendRelocatedInstanceAsync(resend.Player, resend.Path)
+		end)
+		if not resent then
+			newWarn(`Resending relocated '{resend.Path}' failed: {failure}`)
+		end
+	end
+	isResendWorkerRunning = false
+end
+
+local function hasRequestedAncestor(path: string, requested: { [string]: true }): boolean
+	local prefix: string? = nil
+	for segment in string.gmatch(path, "[^%.]+") do
+		if prefix and requested[prefix] then
+			return true
+		end
+		prefix = if prefix then `{prefix}.{segment}` else segment
+	end
+	return false
+end
+
+--[[
+	Server only: handles a client's list of relocated paths that never
+	replicated to it. The paths come from the client, so only a client that
+	has not finished loading may ask, once, and only paths this server's
+	manifest produced are acted on.
+]]
+local function onRelocationRepairRequested(player: Player, paths: unknown)
+	local requestCount = (repairRequestsByPlayer[player] or 0) + 1
+	repairRequestsByPlayer[player] = requestCount
+	if
+		requestCount > RELOCATION_REPAIR_MAX_REQUESTS
+		or player:GetAttribute("_ModulesLoaded")
+		or typeof(paths) ~= "table"
+	then
+		return
+	end
+
+	local requested: { [string]: true } = {}
+	local examined = 0
+	for _, path in paths :: { [any]: unknown } do
+		examined += 1
+		if examined > RELOCATION_REPAIR_MAX_PATHS then
+			break
+		end
+		if typeof(path) ~= "string" then
+			continue
+		end
+		if resendablePaths[path] == true then
+			requested[path] = true
+		elseif resendablePaths[path] == false then
+			newWarn(`Relocated '{path}' never reached {player.Name} but is too large to resend.`)
+		end
+	end
+	-- Resending a folder delivers everything inside it, so only the top-most
+	-- paths are queued.
+	for path in requested do
+		if not hasRequestedAncestor(path, requested) then
+			table.insert(pendingResends, { Player = player, Path = path })
+		end
+	end
+
+	if #pendingResends > 0 and not isResendWorkerRunning then
+		isResendWorkerRunning = true
+		task.spawn(processPendingResendsAsync)
+	end
+end
+
+--[[
+	Client only: waits (bounded) for every manifest entry to exist under
+	RELOCATED_MODULES so the discovery snapshot in getModules sees the full
+	tree. The wait ends as soon as everything has replicated, and it checks
+	for every entry rather than waiting for replication to go quiet, so a
+	stalled partial tree cannot pass. Paths still missing after
+	RELOCATION_REPAIR_DELAY are reported to the server to be resent. Pointer
+	resolution never depends on this, so on timeout the loader warns and
 	proceeds.
 ]]
 local function waitForRelocatedTree()
-	if not RunService:IsClient() then
+	if not isClient then
 		return
 	end
 	local manifest = relocationManifest
 	if not manifest or #manifest == 0 then
 		return
 	end
-	local TREE_CAP = 15
-	local deadline = os.clock() + TREE_CAP
-	local root: Instance? = ReplicatedStorage:FindFirstChild("RELOCATED_MODULES")
-	if not root then
-		root = ReplicatedStorage:WaitForChild("RELOCATED_MODULES", TREE_CAP)
-	end
+	local deadline = os.clock() + RELOCATED_TREE_WAIT_CAP
+	local root: Instance? = ReplicatedStorage:FindFirstChild(RELOCATED_FOLDER_NAME)
+		or ReplicatedStorage:WaitForChild(RELOCATED_FOLDER_NAME, RELOCATED_TREE_WAIT_CAP)
 	if not root then
 		newWarn(
-			`ReplicatedStorage.RELOCATED_MODULES did not replicate within {TREE_CAP}s despite a non-empty relocation manifest; relocated modules may fail to load.`
+			"ReplicatedStorage.RELOCATED_MODULES did not replicate within",
+			`{RELOCATED_TREE_WAIT_CAP}s despite a non-empty relocation manifest; relocated`,
+			"modules may fail to load."
 		)
 		return
 	end
 
-	local missing: { string } = {}
-	for _, entry in ipairs(manifest) do
-		if typeof(entry) ~= "table" or typeof(entry.RelocatedPath) ~= "string" or entry.RelocatedPath == "" then
-			continue
+	local entries: { RelocationManifestEntry } = {}
+	for _, entry in manifest do
+		if
+			typeof(entry) == "table"
+			and typeof(entry.RelocatedPath) == "string"
+			and entry.RelocatedPath ~= ""
+		then
+			table.insert(entries, entry)
 		end
-		local current: Instance? = root
-		for segment in string.gmatch(entry.RelocatedPath, "[^%.]+") do
-			local budget = deadline - os.clock()
-			if budget > 0 then
-				current = (current :: Instance):WaitForChild(segment, budget)
-			else
-				current = (current :: Instance):FindFirstChild(segment)
-			end
-			if not current then
-				break
-			end
+	end
+
+	-- First pass: ask the server to resend whatever is still missing after a
+	-- few seconds.
+	local repairDeadline = math.min(os.clock() + RELOCATION_REPAIR_DELAY, deadline)
+	local missingPrefixes: { [string]: true } = {}
+	for _, entry in entries do
+		local _, missingPrefix = waitForRelocatedPath(root, entry.RelocatedPath, repairDeadline)
+		if missingPrefix then
+			missingPrefixes[missingPrefix] = true
 		end
+	end
+	if next(missingPrefixes) ~= nil then
+		local requested: { string } = {}
+		for prefix in missingPrefixes do
+			table.insert(requested, prefix)
+		end
+		newWarn(
+			`{#requested} relocated path(s) had not replicated after {RELOCATION_REPAIR_DELAY}s;`,
+			"asking the server to resend:\n",
+			table.concat(requested, "\n")
+		)
+		relocationRepairEvent:FireServer(requested)
+	end
+
+	local shortfalls: { string } = {}
+	for _, entry in entries do
+		local current = waitForRelocatedPath(root, entry.RelocatedPath, deadline)
 		if not current then
-			table.insert(missing, entry.RelocatedPath)
 			continue
 		end
 		local expectedDescendants = entry.DescendantCount
 		if typeof(expectedDescendants) ~= "number" or expectedDescendants <= 0 then
 			continue
 		end
-		-- Children that moved with the module may replicate after the module itself.
+		-- Children that moved with the module may replicate after the module
+		-- itself.
 		local leaf = current :: Instance
 		while #leaf:GetDescendants() < expectedDescendants and os.clock() < deadline do
-			task.wait(0.1)
+			task.wait(REPLICATION_POLL_INTERVAL)
 		end
 		local actualDescendants = #leaf:GetDescendants()
 		if actualDescendants < expectedDescendants then
-			table.insert(missing, `{entry.RelocatedPath} ({actualDescendants}/{expectedDescendants} descendants)`)
+			table.insert(
+				shortfalls,
+				`{entry.RelocatedPath} ({actualDescendants}/{expectedDescendants} descendants)`
+			)
 		end
+	end
+
+	-- Discovery runs right after this returns, without yielding, so the last
+	-- step here is always a check that does not yield: another player's resend
+	-- can briefly detach a subtree an earlier step already saw. The check runs
+	-- at least once even when the cap is spent.
+	local tree = root :: Instance
+	local function findAbsentPaths(): { string }
+		local absent: { string } = {}
+		for _, entry in entries do
+			if not waitForRelocatedPath(tree, entry.RelocatedPath, 0) then
+				table.insert(absent, entry.RelocatedPath)
+			end
+		end
+		return absent
+	end
+	local missing = findAbsentPaths()
+	while #missing > 0 and os.clock() < deadline do
+		task.wait(REPLICATION_POLL_INTERVAL)
+		missing = findAbsentPaths()
+	end
+	for _, shortfall in shortfalls do
+		table.insert(missing, shortfall)
 	end
 	if #missing > 0 then
 		newWarn(
-			`{#missing} relocated module(s) had not replicated within {TREE_CAP}s and may fail to load:\n`,
+			`{#missing} relocated module(s) had not replicated within {RELOCATED_TREE_WAIT_CAP}s`,
+			"and may fail to load:\n",
 			table.concat(missing, "\n")
 		)
 	end
 end
 
 -----------------------------
--- MAIN --
+-- PUBLIC FUNCTIONS --
 -----------------------------
 
 --[[
-	Starts the loader with the default module filtering behavior.
+	Starts the loader with the default module filtering. Searches every
+	folder passed in, as well as tagged modules and folders. Call once per
+	realm.
 ]]
-local function start(...: Instance)
+function Module.Start(...: Instance)
 	assert(not started, "attempt to start module loader more than once")
 	started = true
-	local containers = {...}
+	local containers = { ... }
 	if isServer then
 		local manifest = relocateToReplicatedStoragePass(containers)
-		-- Manifest before RelocationComplete: clients treat the flag as "manifest is readable".
+		recordResendablePaths(manifest)
+		-- Manifest before RelocationComplete: clients treat the flag as
+		-- "manifest is readable".
 		script:SetAttribute("_RelocationManifest", HttpService:JSONEncode(manifest))
 		script:SetAttribute("RelocationComplete", true)
 	else
 		waitForRelocationRebuild()
-		waitForRelocatedTree()
 	end
-	if
-		isClient
-		and SETTINGS.WAIT_FOR_SERVER
-		and not script:GetAttribute("ServerLoaded")
-	then
-		script:GetAttributeChangedSignal("ServerLoaded"):Wait()
+	if isClient and settings.WAIT_FOR_SERVER then
+		waitForAttributeAsync(script, "ServerLoaded")
 	end
-	if
-		isClient
-		and SETTINGS.WAIT_FOR_PERSISTENT
-		and not workspace:GetAttribute("IsPersistentLoaded")
-	then
-		workspace:GetAttributeChangedSignal("IsPersistentLoaded"):Wait()
+	if isClient and settings.WAIT_FOR_PERSISTENT then
+		waitForAttributeAsync(workspace, "IsPersistentLoaded")
 	end
+	-- Right before discovery, with no yield in between, so getModules sees the
+	-- tree this verified.
+	waitForRelocatedTree()
 
-	if SETTINGS.VERBOSE_LOADING then
+	if settings.VERBOSE_LOADING then
 		newWarn("=== LOADING MODULES ===")
-		local modules = getModules(containers)
-		for _, module in modules do
-			loadModule(module)
-		end
+	end
+	local phaseStartTime = os.clock()
+	local modules = getModules(containers)
+	for _, module in modules do
+		loadModule(module)
+	end
+	recordOwnedLifecycleMethods()
+	local loadDuration = os.clock() - phaseStartTime
 
+	if settings.VERBOSE_LOADING then
 		newWarn("=== INITIALIZING MODULES ===")
-		for _, module in modules do
-			if not tracker.Load[module] then
-				continue
-			end
-			initializeModule(tracker.Load[module], module)
+	end
+	phaseStartTime = os.clock()
+	for _, module in modules do
+		local loadedModule = tracker.Load[module]
+		if not loadedModule then
+			continue
 		end
+		runLifecycleMethodAsync(loadedModule, module, "Init")
+	end
+	local initDuration = os.clock() - phaseStartTime
 
+	if settings.VERBOSE_LOADING then
 		newWarn("=== STARTING MODULES ===")
-		for _, module in modules do
-			if not tracker.Load[module] then
-				continue
-			end
-			startModule(tracker.Load[module], module)
+	end
+	phaseStartTime = os.clock()
+	for _, module in modules do
+		local loadedModule = tracker.Load[module]
+		if not loadedModule then
+			continue
 		end
+		if tracker.Init[module] == false then
+			newWarn(`>> Skipping :Start() for module {module.Name} because its :Init() failed`)
+			continue
+		end
+		runLifecycleMethodAsync(loadedModule, module, "Start")
+	end
+	local startDuration = os.clock() - phaseStartTime
 
+	if settings.VERBOSE_LOADING then
 		newWarn("=== LOADING FINISHED ===")
-	else
-		local modules = getModules(containers)
-		for _, module in modules do
-			loadModule(module)
-		end
-		for _, module in modules do
-			if not tracker.Load[module] then
-				continue
-			end
-			initializeModule(tracker.Load[module], module)
-		end
-		for _, module in modules do
-			if not tracker.Load[module] then
-				continue
-			end
-			startModule(tracker.Load[module], module)
-		end
+		newWarn(
+			`Took {formatSeconds(loadDuration + initDuration + startDuration)} seconds total`,
+			`(require {formatSeconds(loadDuration)}, init {formatSeconds(initDuration)},`,
+			`start {formatSeconds(startDuration)})`
+		)
 	end
 
 	script:SetAttribute(`{LOADED_IDENTIFIER}LoadedTimestamp`, workspace:GetServerTimeNow())
 	script:SetAttribute(`{LOADED_IDENTIFIER}Loaded`, true)
-	if RunService:IsClient() then
+	if isClient then
 		loadedEvent:FireServer()
 	end
 end
 
 --[[
-	Starts the loader with your own custom module filtering behavior for determining what modules should be loaded.
+	Starts the loader with your own filter deciding which discovered modules
+	load. Relocation still follows the default rules.
 ]]
-local function startCustom(shouldKeep: KeepModulePredicate, ...: Instance)
-	keepModule = shouldKeep
-	start(...)
+function Module.StartCustom(shouldKeep: KeepModulePredicate, ...: Instance)
+	customKeepModule = shouldKeep
+	Module.Start(...)
 end
 
 --[[
-	Returns if the client finished loading, initializing, and starting all modules.
+	Overrides the settings read from the attributes on the module loader. Keys
+	left out of <code>newSettings</code> keep their current value.
 ]]
-local function isClientLoaded(player: Player): boolean
+function Module.ChangeSettings(newSettings: LoaderSettings)
+	local overrides: { [string]: any } = newSettings :: any
+	local current: { [string]: any } = settings :: any
+	for key, value in overrides do
+		current[key] = value
+	end
+end
+
+--[[
+	Returns if the server finished loading, initializing, and starting all
+	modules.
+]]
+function Module.IsServerLoaded(): boolean
+	return script:GetAttribute("ServerLoaded") == true
+end
+
+--[[
+	Returns if the client finished loading, initializing, and starting all
+	modules.
+]]
+function Module.IsClientLoaded(player: Player): boolean
 	return player:GetAttribute("_ModulesLoaded") == true
 end
 
 --[[
-	Client-only.
+	Client only. Returns if persistent models have streamed into workspace.
 ]]
-local function isPersistentLoaded()
-	assert(RunService:IsClient(), "isPersistentLoaded is client-only!")
+function Module.IsPersistentLoaded(): boolean
+	assert(isClient, "isPersistentLoaded is client-only!")
 	return workspace:GetAttribute("IsPersistentLoaded") == true
-end
-
---[[
-	Returns if the server finished loading, initializing, and starting all modules.
-]]
-local function isServerLoaded(): boolean
-	return script:GetAttribute("ServerLoaded") == true
 end
 
 --[[
@@ -1643,52 +2126,80 @@ end
 	Yields until the client has loaded all their modules.
 	Returns true if loaded or returns false if player left.
 ]]
-local function waitForLoadedClient(player: Player): boolean
-	if not player:GetAttribute("_ModulesLoaded") then
-		return waitForEither(player:GetAttributeChangedSignal("_ModulesLoaded"), player:GetPropertyChangedSignal("Parent"))
+function Module.WaitForLoadedClient(player: Player): boolean
+	if player:GetAttribute("_ModulesLoaded") then
+		return true
 	end
-	return true
+	-- A player who already left will never fire either signal.
+	if not player.Parent then
+		return false
+	end
+	return waitForEither(
+		player:GetAttributeChangedSignal("_ModulesLoaded"),
+		player:GetPropertyChangedSignal("Parent")
+	)
 end
 
 --[[
-	Modify the default settings determined by the attributes on the module loader.
-	The given <code>settings</code> are reconciled with the current settings.
+	Returns the server time (workspace:GetServerTimeNow()) when the server
+	finished loading. Errors if the server is not loaded yet.
 ]]
-local function changeSettings(settings: LoaderSettings)
-	SETTINGS = reconcile(settings, SETTINGS)
+function Module.GetServerLoadedTimestamp(): number
+	assert(Module.IsServerLoaded(), "server is not loaded yet!")
+	return script:GetAttribute("ServerLoadedTimestamp") :: number
 end
 
---[[
-	Errors if the server is not loaded yet.
-]]
-local function getServerLoadedTimestamp()
-	assert(isServerLoaded(), "server is not loaded yet!")
-	return script:GetAttribute("ServerLoadedTimestamp")
-end
+-----------------------------
+-- MAIN --
+-----------------------------
+local verboseLoading = readSettingAttribute("VerboseLoading", "boolean")
+settings = {
+	WAIT_FOR_PERSISTENT = readSettingAttribute("ClientWaitForPersistentLoaded", "boolean") == true,
+	YIELD_THRESHOLD = readSettingAttribute("YieldThreshold", "number") or DEFAULT_YIELD_THRESHOLD,
+	VERBOSE_LOADING = if verboseLoading == nil then DEFAULT_VERBOSE_LOADING else verboseLoading,
+	WAIT_FOR_SERVER = readSettingAttribute("ClientWaitForServer", "boolean") == true,
+	USE_COLLECTION_SERVICE = readSettingAttribute("UseCollectionService", "boolean") == true,
+}
+loaderTag = readSettingAttribute("LoaderTag", "string") or DEFAULT_LOADER_TAG
+loadedEvent = getLoaderRemoteAsync("LoadedEvent")
+relocationRepairEvent = getLoaderRemoteAsync("RelocationRepairEvent")
 
-if isServer then
-	local clone = script.PersistentLoadedCheck:Clone()
-	clone.Enabled = true
-	clone.Parent = ReplicatedFirst
+if isRunning and isServer then
+	-- Attributes copied out of a running play session survive in the place
+	-- file; stale relocation state would make clients skip the gate before the
+	-- real pre-pass runs.
+	script:SetAttribute("RelocationComplete", nil)
+	script:SetAttribute("_RelocationManifest", nil)
+
+	local persistentLoadedCheck = script.PersistentLoadedCheck:Clone()
+	persistentLoadedCheck.Enabled = true
+	persistentLoadedCheck.Parent = ReplicatedFirst
 	loadedEvent.OnServerEvent:Connect(function(player)
 		player:SetAttribute("_ModulesLoaded", true)
 	end)
-else
-	-- Rebuild pointers as soon as the manifest replicates rather than when Start() happens to be
-	-- called, shrinking the window where non-loader client code can hit a missing SSS path.
+	relocationRepairEvent.OnServerEvent:Connect(onRelocationRepairRequested)
+	Players.PlayerRemoving:Connect(function(player)
+		repairRequestsByPlayer[player] = nil
+	end)
+elseif isRunning then
+	-- Rebuild pointers as soon as the manifest replicates rather than when
+	-- Start() happens to be called, shrinking the window where non-loader
+	-- client code can hit a missing ServerScriptService path.
 	task.spawn(clientRelocationBootstrap)
 end
 
--- Unstable internal surface exposed for tests only; nil outside Studio so test hooks never run in
--- live servers. Reassigned locals (SETTINGS, keepModule, relocationManifest, TAG) go through
--- getters/setters so tests always see the live value.
+-- Unstable internal surface exposed for tests only; nil outside Studio so test
+-- hooks never run in live servers. Values that get reassigned (settings,
+-- the keep filter, the relocation manifest, the loader tag) go through
+-- functions so tests always see the live value.
 local internalsForTest: { [string]: any }? = nil
 if RunService:IsStudio() then
 	internalsForTest = {
 		-- discovery / filtering
 		getModules = getModules,
 		keepModule = function(container: Instance, module: ModuleScript): boolean
-			return keepModule(container, module)
+			local shouldKeep: KeepModulePredicate = customKeepModule or keepModule
+			return shouldKeep(container, module)
 		end,
 		findAllFromClass = findAllFromClass,
 		getDepthInHierarchy = getDepthInHierarchy,
@@ -1708,25 +2219,33 @@ if RunService:IsStudio() then
 		getOrCreateClientFolderPath = getOrCreateClientFolderPath,
 		waitForRelocationRebuild = waitForRelocationRebuild,
 		waitForRelocatedTree = waitForRelocatedTree,
+		waitForRelocatedPath = waitForRelocatedPath,
+		-- relocation (server repair)
+		recordResendablePaths = recordResendablePaths,
+		resendRelocatedInstanceAsync = resendRelocatedInstanceAsync,
+		onRelocationRepairRequested = onRelocationRepairRequested,
 		-- lifecycle
 		loadModule = loadModule,
-		initializeModule = initializeModule,
-		startModule = startModule,
+		initializeModule = function(loadedModule: any, module: ModuleScript)
+			runLifecycleMethodAsync(loadedModule, module, "Init")
+		end,
+		startModule = function(loadedModule: any, module: ModuleScript)
+			runLifecycleMethodAsync(loadedModule, module, "Start")
+		end,
+		recordOwnedLifecycleMethods = recordOwnedLifecycleMethods,
+		getLifecycleMethod = getLifecycleMethod,
 		-- utilities
-		copy = copy,
-		reconcile = reconcile,
-		filter = filter,
-		mergeArrays = mergeArrays,
 		waitForEither = waitForEither,
-		-- test control knobs; each returns the previous value so tests can restore it
+		-- test control knobs; each returns the previous value so tests can
+		-- restore it
 		setLoaderTag = function(tag: string): string
-			local previous = TAG
-			TAG = tag
+			local previous = loaderTag
+			loaderTag = tag
 			return previous
 		end,
 		setUseCollectionService = function(enabled: boolean?): boolean?
-			local previous = SETTINGS.USE_COLLECTION_SERVICE
-			SETTINGS.USE_COLLECTION_SERVICE = enabled
+			local previous = settings.USE_COLLECTION_SERVICE
+			settings.USE_COLLECTION_SERVICE = enabled
 			return previous
 		end,
 		-- live state
@@ -1734,22 +2253,13 @@ if RunService:IsStudio() then
 			return tracker
 		end,
 		getSettings = function(): LoaderSettings
-			return SETTINGS
+			return settings
 		end,
 		getRelocationManifest = function(): { any }?
 			return relocationManifest
 		end,
 	}
 end
+Module._internalsForTest = internalsForTest
 
-return {
-	Start = start,
-	StartCustom = startCustom,
-	ChangeSettings = changeSettings,
-	IsServerLoaded = isServerLoaded,
-	IsClientLoaded = isClientLoaded,
-	IsPersistentLoaded = isPersistentLoaded,
-	WaitForLoadedClient = waitForLoadedClient,
-	GetServerLoadedTimestamp = getServerLoadedTimestamp,
-	_internalsForTest = internalsForTest,
-}
+return Module
