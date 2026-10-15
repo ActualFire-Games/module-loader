@@ -203,9 +203,9 @@ export type KeepModulePredicate = (container: Instance, module: ModuleScript) ->
 -- One entry per relocated module, JSON-encoded into the _RelocationManifest
 -- attribute.
 type RelocationManifestEntry = {
-	-- Dotted path under RELOCATED_MODULES, where the real module now lives.
+	-- Slash-separated path under RELOCATED_MODULES, where the real module now lives.
 	RelocatedPath: string,
-	-- Original dotted path under ServerScriptService, nil when relocated from
+	-- Original slash-separated path under ServerScriptService, nil when relocated from
 	-- elsewhere.
 	ServerScriptServicePath: string?,
 	-- Loader-filter attributes mirrored onto rebuilt client pointers.
@@ -247,6 +247,12 @@ const DEFAULT_YIELD_THRESHOLD = 10
 const DEFAULT_VERBOSE_LOADING = true
 -- Keep in sync with RelocatedTemplate, which finds the folder by this name.
 const RELOCATED_FOLDER_NAME = "RELOCATED_MODULES"
+-- Relocation paths join instance names with "/", the separator string
+-- requires use, because package managers put dots in folder names (".pesde",
+-- "1.2.0"). Keep in sync with RelocatedTemplate and with the index modules
+-- of system packages, which split _OriginalSSSPath on it.
+const PATH_SEPARATOR = "/"
+const PATH_SEGMENT_PATTERN = "[^/]+"
 const SLOW_CALL_WARNING_INTERVAL = 5
 const REPLICATION_POLL_INTERVAL = 0.1
 -- A pointer can point at another pointer; resolution stops after this many
@@ -364,7 +370,7 @@ local relocationManifest: { RelocationManifestEntry }? = nil
 local relocationRebuildDone = false
 local relocationRebuildSignal = Instance.new("BindableEvent")
 
--- Server relocation-repair state. resendablePaths holds every dotted path the
+-- Server relocation-repair state. resendablePaths holds every path the
 -- pre-pass produced (each relocated module and each mirrored folder above
 -- it), true when the subtree is small enough to resend. Resends run one at a
 -- time from pendingResends.
@@ -580,28 +586,28 @@ local function keepModule(container: Instance, module: ModuleScript): boolean
 end
 
 --[[
-	Returns the dot-separated path from <code>module</code> up to (but
+	Returns the slash-separated path from <code>module</code> up to (but
 	excluding) <code>container</code>.
 ]]
-local function getDottedPathToContainer(module: Instance, container: Instance): string
+local function getPathToContainer(module: Instance, container: Instance): string
 	local segments = { module.Name }
 	local current: Instance? = module.Parent
 	while current and current ~= container do
 		table.insert(segments, 1, current.Name)
 		current = current.Parent
 	end
-	return table.concat(segments, ".")
+	return table.concat(segments, PATH_SEPARATOR)
 end
 
 --[[
-	Returns the dot-separated path from <code>service</code> (exclusive) down
-	to <code>instance</code> (inclusive), e.g. "Gameplay.Combat.DamageMath", or
+	Returns the slash-separated path from <code>service</code> (exclusive) down
+	to <code>instance</code> (inclusive), e.g. "Gameplay/Combat/DamageMath", or
 	<code>nil</code> if <code>instance</code> is not a descendant of
-	<code>service</code>. Unlike getDottedPathToContainer this anchors to a
+	<code>service</code>. Unlike getPathToContainer this anchors to a
 	service, so the client can rebuild the full original hierarchy under its
 	own local ServerScriptService.
 ]]
-local function getDottedPathFromService(instance: Instance, service: Instance): string?
+local function getPathFromService(instance: Instance, service: Instance): string?
 	local segments = { instance.Name }
 	local current: Instance? = instance.Parent
 	while current and current ~= service do
@@ -611,7 +617,7 @@ local function getDottedPathFromService(instance: Instance, service: Instance): 
 	if current ~= service then
 		return nil
 	end
-	return table.concat(segments, ".")
+	return table.concat(segments, PATH_SEPARATOR)
 end
 
 --[[
@@ -720,7 +726,7 @@ local function resolveRelocationTarget(module: ModuleScript, depth: number?): Mo
 	end
 
 	local current: Instance? = service:FindFirstChild(RELOCATED_FOLDER_NAME)
-	for segment in string.gmatch(path, "[^%.]+") do
+	for segment in string.gmatch(path, PATH_SEGMENT_PATTERN) do
 		if not current then
 			return module
 		end
@@ -958,10 +964,11 @@ local function tryRelocateModule(
 
 	local relocationRoot = destination or ensureReplicatedRelocatedFolder()
 	local originalParent = module.Parent
-	local relocatedPath = getDottedPathToContainer(module, container)
-	-- The manifest is the authoritative copy of this path; the attribute stays
-	-- for debugging.
-	local originalServerPath = getDottedPathFromService(module, ServerScriptService)
+	local relocatedPath = getPathToContainer(module, container)
+	-- The manifest carries this path to clients. The attribute is part of the
+	-- loader's contract too: a system package's index reads it on the server to
+	-- find the server-only modules left in the original folder.
+	local originalServerPath = getPathFromService(module, ServerScriptService)
 	if originalServerPath then
 		module:SetAttribute("_OriginalSSSPath", originalServerPath)
 	end
@@ -1535,13 +1542,13 @@ local function rebuildServerScriptServiceHierarchy(manifest: { any })
 			-- were relocated; the first entry wins, matching the server-side
 			-- collision warning.
 			newWarn(
-				`Duplicate relocated path 'ServerScriptService.{originalPath}' in the relocation`,
+				`Duplicate relocated path 'ServerScriptService/{originalPath}' in the relocation`,
 				"manifest; requires of this path may resolve to the wrong module."
 			)
 			continue
 		end
 
-		local segments: { string } = string.split(originalPath, ".")
+		local segments: { string } = string.split(originalPath, PATH_SEPARATOR)
 		local leafName = table.remove(segments) :: string
 
 		local parent = getOrCreateClientFolderPath(ServerScriptService, segments)
@@ -1551,7 +1558,7 @@ local function rebuildServerScriptServiceHierarchy(manifest: { any })
 				and existing:GetAttribute("_RelocatedService") ~= nil
 			if not isOwnPointer then
 				newWarn(
-					`Cannot rebuild relocated path 'ServerScriptService.{originalPath}':`,
+					`Cannot rebuild relocated path 'ServerScriptService/{originalPath}':`,
 					`'{existing:GetFullName()}' already occupies that name; requires of this path`,
 					"may resolve to the wrong instance."
 				)
@@ -1685,9 +1692,9 @@ local function waitForRelocationRebuild()
 end
 
 --[[
-	Walks a dotted <code>relocatedPath</code> under <code>root</code>, waiting
+	Walks a slash-separated <code>relocatedPath</code> under <code>root</code>, waiting
 	for each segment until <code>deadline</code> (an os.clock() time). Returns
-	the instance at the path, or nil and the dotted path of the first segment
+	the instance at the path, or nil and the path up to the first segment
 	that never arrived.
 ]]
 local function waitForRelocatedPath(
@@ -1697,14 +1704,14 @@ local function waitForRelocatedPath(
 ): (Instance?, string?)
 	local current = root
 	local walked: { string } = {}
-	for segment in string.gmatch(relocatedPath, "[^%.]+") do
+	for segment in string.gmatch(relocatedPath, PATH_SEGMENT_PATTERN) do
 		table.insert(walked, segment)
 		local budget = deadline - os.clock()
 		local child = if budget > 0
 			then current:WaitForChild(segment, budget)
 			else current:FindFirstChild(segment)
 		if not child then
-			return nil, table.concat(walked, ".")
+			return nil, table.concat(walked, PATH_SEPARATOR)
 		end
 		current = child
 	end
@@ -1725,8 +1732,8 @@ local function recordResendablePaths(manifest: { RelocationManifestEntry })
 	for _, entry in manifest do
 		local prefix: string? = nil
 		local instance: Instance? = root
-		for segment in string.gmatch(entry.RelocatedPath, "[^%.]+") do
-			prefix = if prefix then `{prefix}.{segment}` else segment
+		for segment in string.gmatch(entry.RelocatedPath, PATH_SEGMENT_PATTERN) do
+			prefix = if prefix then `{prefix}{PATH_SEPARATOR}{segment}` else segment
 			instance = if instance then instance:FindFirstChild(segment) else nil
 			local path = prefix :: string
 			if instance and resendablePaths[path] == nil then
@@ -1748,7 +1755,7 @@ local function resendRelocatedInstanceAsync(player: Player, path: string)
 		return
 	end
 	local instance: Instance? = root
-	for segment in string.gmatch(path, "[^%.]+") do
+	for segment in string.gmatch(path, PATH_SEGMENT_PATTERN) do
 		instance = (instance :: Instance):FindFirstChild(segment)
 		if not instance then
 			return
@@ -1810,11 +1817,11 @@ end
 
 local function hasRequestedAncestor(path: string, requested: { [string]: true }): boolean
 	local prefix: string? = nil
-	for segment in string.gmatch(path, "[^%.]+") do
+	for segment in string.gmatch(path, PATH_SEGMENT_PATTERN) do
 		if prefix and requested[prefix] then
 			return true
 		end
-		prefix = if prefix then `{prefix}.{segment}` else segment
+		prefix = if prefix then `{prefix}{PATH_SEPARATOR}{segment}` else segment
 	end
 	return false
 end
@@ -2209,8 +2216,8 @@ if RunService:IsStudio() then
 		isMarkedForReplicatedRelocation = isMarkedForReplicatedRelocation,
 		isOptingOutOfReplicatedRelocation = isOptingOutOfReplicatedRelocation,
 		getOrCreateMirroredParent = getOrCreateMirroredParent,
-		getDottedPathToContainer = getDottedPathToContainer,
-		getDottedPathFromService = getDottedPathFromService,
+		getPathToContainer = getPathToContainer,
+		getPathFromService = getPathFromService,
 		resolveRelocationTarget = resolveRelocationTarget,
 		ensureReplicatedRelocatedFolder = ensureReplicatedRelocatedFolder,
 		-- relocation (client rebuild)

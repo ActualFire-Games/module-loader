@@ -4,8 +4,8 @@
 
 	The ModuleLoader writes two attributes on every pointer at relocation time:
 		_RelocatedService	"ServerScriptService" or "ReplicatedStorage"
-		_RelocatedPath		dot-separated path under that service's RELOCATED_MODULES
-							folder (e.g. "Gameplay.Combat.Shared.DamageMath")
+		_RelocatedPath		slash-separated path under that service's RELOCATED_MODULES
+							folder (e.g. "Gameplay/Combat/Shared/DamageMath")
 
 	The pointer resolves by walking the path with WaitForChild so first-join
 	clients tolerate slow replication. When pointing to ServerScriptService,
@@ -51,7 +51,8 @@ if not current then
 	)
 end
 
-for segment in string.gmatch(relocatedPath, "[^%.]+") do
+-- Keep in sync with the ModuleLoader's PATH_SEPARATOR.
+for segment in string.gmatch(relocatedPath, "[^/]+") do
 	current = (current :: Instance):WaitForChild(segment, WAIT_PER_SEGMENT)
 	if not current then
 		error(
